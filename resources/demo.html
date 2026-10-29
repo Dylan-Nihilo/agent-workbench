@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>今日清单 · 交互示例</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: #fff;
+        color: #33382e;
+        font:
+          14px -apple-system,
+          BlinkMacSystemFont,
+          'PingFang SC',
+          sans-serif;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 24px 30px;
+        border-bottom: 1px solid #eeefe8;
+      }
+      header strong {
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.3px;
+      }
+      header span {
+        font-size: 10px;
+        color: #9ba18f;
+      }
+      main {
+        max-width: 650px;
+        margin: 0 auto;
+        padding: 44px 38px;
+      }
+      small {
+        font-size: 10px;
+        color: #8b947f;
+        letter-spacing: 1.3px;
+      }
+      h1 {
+        font-size: 29px;
+        font-weight: 500;
+        letter-spacing: -0.6px;
+        margin: 14px 0 12px;
+      }
+      p {
+        font-size: 12px;
+        color: #959b8d;
+        line-height: 1.9;
+        margin: 0 0 29px;
+      }
+      form {
+        display: flex;
+        gap: 8px;
+        margin: 0 0 27px;
+      }
+      input,
+      select,
+      button {
+        font: inherit;
+      }
+      input[type='text'] {
+        flex: 1;
+        min-width: 0;
+        border: 1px solid #e0e4d9;
+        border-radius: 7px;
+        padding: 11px 12px;
+        font-size: 12px;
+        outline: none;
+      }
+      input:focus {
+        border-color: #8fa77a;
+        box-shadow: 0 0 0 2px #8fa77a15;
+      }
+      button {
+        cursor: pointer;
+        border: 0;
+        border-radius: 7px;
+        background: #5d754d;
+        color: white;
+        padding: 10px 16px;
+        font-size: 12px;
+      }
+      button:hover {
+        background: #4b633d;
+      }
+      .list-label {
+        display: flex;
+        justify-content: space-between;
+        color: #909887;
+        font-size: 10px;
+        padding-bottom: 11px;
+        border-bottom: 1px solid #ecefe6;
+      }
+      ul {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+      }
+      li {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-height: 57px;
+        border-bottom: 1px solid #f0f2eb;
+        font-size: 12px;
+      }
+      input[type='checkbox'] {
+        accent-color: #6e875c;
+        width: 15px;
+        height: 15px;
+        cursor: pointer;
+      }
+      li label {
+        flex: 1;
+        cursor: pointer;
+        line-height: 1.7;
+      }
+      li.done label {
+        text-decoration: line-through;
+        color: #a6ad9b;
+      }
+      .category {
+        font-size: 9px;
+        color: #98a08c;
+        background: #f1f4eb;
+        padding: 4px 7px;
+        border-radius: 4px;
+      }
+      footer {
+        margin-top: 30px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 10px;
+        color: #a3aa97;
+      }
+      select {
+        border: 1px solid #e8ebdf;
+        border-radius: 5px;
+        background: #fff;
+        color: #7c876f;
+        padding: 6px 7px;
+        font-size: 10px;
+        outline: none;
+      }
+      #status {
+        font-size: 11px;
+        color: #738764;
+        min-height: 20px;
+        margin-top: 15px;
+      }
+      .empty {
+        padding: 25px 0;
+        color: #9ca491;
+        text-align: center;
+      }
+      label[for='task'] {
+        display: block;
+        font-size: 11px;
+        color: #7e8873;
+        margin-bottom: 9px;
+      }
+    </style>
+  </head>
+  <body>
+    <header><strong>Fieldnotes</strong><span>交互示例</span></header>
+    <main>
+      <small>A LITTLE FOCUS</small>
+      <h1>留一点时间，<br />给重要的事。</h1>
+      <p>把想做的事记下来，一件一件完成。</p>
+      <label for="task">添加一项任务</label>
+      <form id="form">
+        <input id="task" type="text" placeholder="接下来想完成什么？" autocomplete="off" /><button
+          type="submit"
+        >
+          添加
+        </button>
+      </form>
+      <div class="list-label"><span>今日清单</span><span id="count">0 项待办</span></div>
+      <ul id="tasks"></ul>
+      <footer>
+        <span>不着急，一步一步来。</span
+        ><select aria-label="筛选任务" id="filter">
+          <option value="all">全部任务</option>
+          <option value="pending">仅待完成</option>
+          <option value="done">仅已完成</option>
+        </select>
+      </footer>
+      <div id="status" role="status" aria-live="polite"></div>
+    </main>
+    <script>
+      const tasks = [
+        { id: 1, text: '整理今日会议纪要', done: false },
+        { id: 2, text: '确认产品交互细节', done: false },
+        { id: 3, text: '给自己安排一段散步时间', done: true },
+      ];
+      let seq = 4;
+      function render() {
+        const list = document.getElementById('tasks');
+        list.replaceChildren();
+        const filter = document.getElementById('filter').value;
+        tasks
+          .filter((t) => filter === 'all' || (filter === 'done' ? t.done : !t.done))
+          .forEach((t) => {
+            const li = document.createElement('li');
+            li.className = t.done ? 'done' : '';
+            const input = document.createElement('input');
+            input.type = 'checkbox';
+            input.checked = t.done;
+            input.id = 'task-' + t.id;
+            input.addEventListener('change', () => {
+              t.done = input.checked;
+              document.getElementById('status').textContent = t.done
+                ? '已完成：' + t.text
+                : '已恢复：' + t.text;
+              render();
+            });
+            const label = document.createElement('label');
+            label.htmlFor = input.id;
+            label.textContent = t.text;
+            li.append(input, label);
+            list.append(li);
+          });
+        document.getElementById('count').textContent =
+          tasks.filter((t) => !t.done).length + ' 项待办';
+        if (!list.children.length) {
+          const empty = document.createElement('li');
+          empty.className = 'empty';
+          empty.textContent = '这里暂时没有任务';
+          list.append(empty);
+        }
+      }
+      document.getElementById('form').addEventListener('submit', (e) => {
+        e.preventDefault();
+        const input = document.getElementById('task');
+        const text = input.value.trim();
+        if (!text) {
+          document.getElementById('status').textContent = '请先输入任务内容';
+          input.focus();
+          return;
+        }
+        tasks.push({ id: seq++, text, done: false });
+        input.value = '';
+        render();
+        document.getElementById('status').textContent = '已添加：' + text;
+      });
+      document.getElementById('filter').addEventListener('change', render);
+      render();
+    </script>
+  </body>
+</html>

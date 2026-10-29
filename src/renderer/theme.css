@@ -1,0 +1,16 @@
+:root {
+  --canvas: #f6f5f1;
+  --paper: #fdfcf9;
+  --sidebar: #f0efe9;
+  --ink: #30332c;
+  --secondary: #65695f;
+  --muted: #92958a;
+  --faint: #a5a79d;
+  --line: #e5e3db;
+  --line-strong: #dbd9cf;
+  --hover: #e9e8e0;
+  --accent: #536b49;
+  --accent-soft: #b7c5ac;
+  --accent-wash: #edf1e7;
+  --danger: #a26954;
+}
