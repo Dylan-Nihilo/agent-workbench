@@ -1349,6 +1349,63 @@ kbd {
 .approval-card .button-row {
   justify-content: flex-end;
 }
+.request-task {
+  display: block;
+  max-width: 100%;
+  margin-top: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.request-questions {
+  max-height: 35vh;
+  overflow-y: auto;
+  margin: 12px 0;
+}
+.request-questions fieldset {
+  border: 0;
+  margin: 0 0 16px;
+  padding: 0;
+  min-width: 0;
+}
+.request-questions legend {
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  padding: 0 0 8px;
+}
+.request-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 0;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.request-option input {
+  margin-top: 3px;
+}
+.request-option strong {
+  font-weight: 500;
+}
+.request-option small {
+  display: block;
+  color: var(--muted);
+}
+.request-answer {
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid #d8cfb4;
+  border-radius: 7px;
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  resize: vertical;
+}
 .toast {
   position: fixed;
   left: 50%;

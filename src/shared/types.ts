@@ -101,6 +101,20 @@ export interface ApprovalRequest {
   detail: string;
   kind: 'command' | 'file' | 'other';
 }
+export interface UserInputRequest {
+  id: string;
+  questions: Array<{
+    id: string;
+    header: string;
+    question: string;
+    isSecret: boolean;
+    isOther?: boolean;
+    options?: Array<{ label: string; description: string }>;
+  }>;
+}
+export type PendingAgentRequest =
+  | { conversationId: string; messageId: string; kind: 'approval'; request: ApprovalRequest }
+  | { conversationId: string; messageId: string; kind: 'input'; request: UserInputRequest };
 export type AgentEvent =
   | { type: 'delta'; text: string }
   | { type: 'tool'; call: ToolCall }
@@ -110,6 +124,8 @@ export type AgentEvent =
       label?: string;
     }
   | { type: 'approval'; request: ApprovalRequest }
+  | { type: 'user-input'; request: UserInputRequest }
+  | { type: 'request-resolved'; id: string }
   | { type: 'complete'; text?: string; sessionId?: string }
   | { type: 'error'; message: string };
 export interface ChatMessage {
@@ -164,6 +180,7 @@ export interface AppSnapshot {
   conversations: Conversation[];
   recordings: Recording[];
   browserFrame?: BrowserFrame;
+  pendingRequests?: PendingAgentRequest[];
 }
 export type AppEvent =
   | { type: 'browser:state'; state: BrowserState }
@@ -171,7 +188,7 @@ export type AppEvent =
   | { type: 'browser:step'; step: RecordedStep }
   | { type: 'browser:selected'; element: ElementRef }
   | { type: 'recording:saved'; recording: Recording }
-  | { type: 'agent:event'; conversationId: string; event: AgentEvent }
+  | { type: 'agent:event'; conversationId: string; messageId: string; event: AgentEvent }
   | { type: 'feishu:state'; state: FeishuState }
   | { type: 'conversation:updated'; conversation: Conversation }
   | { type: 'notice'; message: string; level: 'info' | 'error' };

@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { BrowserRuntime } from './browser';
 import { CodexSession, detectAgents } from './agents';
 import { FeishuConnector } from './feishu';
+import { TurnNotifications } from './notifications';
 import { Store } from './store';
 import type {
   AgentEvent,
@@ -17,6 +18,7 @@ import type {
   ChatMessage,
   Conversation,
   FeishuMessage,
+  PendingAgentRequest,
   Recording,
 } from '../shared/types';
 
@@ -29,7 +31,14 @@ let browser: BrowserRuntime;
 let feishu: FeishuConnector;
 let agents: AgentInfo[] = [];
 let active:
-  | { conversationId: string; messageId: string; session: CodexSession; readonly: boolean }
+  | {
+      conversationId: string;
+      messageId: string;
+      session: CodexSession;
+      readonly: boolean;
+      notifications: TurnNotifications;
+      requests: PendingAgentRequest[];
+    }
   | undefined;
 let startingTurn = false;
 let lastFrame: BrowserFrame | undefined;
@@ -86,6 +95,19 @@ function createConversation(title = '新对话') {
 }
 function onAgentEvent(conversationId: string, assistant: ChatMessage, event: AgentEvent) {
   const conversation = getConversation(conversationId);
+  if (active?.conversationId === conversationId) {
+    if (event.type === 'approval' || event.type === 'user-input') {
+      active.requests = active.requests.filter((item) => item.request.id !== event.request.id);
+      active.requests.push(
+        event.type === 'approval'
+          ? { conversationId, messageId: assistant.id, kind: 'approval', request: event.request }
+          : { conversationId, messageId: assistant.id, kind: 'input', request: event.request },
+      );
+    } else if (event.type === 'request-resolved') {
+      active.requests = active.requests.filter((item) => item.request.id !== event.id);
+    } else if (event.type === 'complete' || event.type === 'error') active.requests = [];
+    active.notifications.handle(event);
+  }
   if (event.type === 'delta') assistant.text += event.text;
   if (event.type === 'tool') {
     assistant.tools ??= [];
@@ -104,7 +126,7 @@ function onAgentEvent(conversationId: string, assistant: ChatMessage, event: Age
   }
   conversation.updatedAt = Date.now();
   store.schedule();
-  emit({ type: 'agent:event', conversationId, event });
+  emit({ type: 'agent:event', conversationId, messageId: assistant.id, event });
 }
 async function runTurn(
   conversation: Conversation,
@@ -167,17 +189,37 @@ async function runTurn(
     });
     sessions.set(conversation.id, session);
   }
-  active = { conversationId: conversation.id, messageId: assistant.id, session, readonly };
+  const notifications = new TurnNotifications(
+    { id: assistant.id, title: conversation.title, source },
+    (id, message) => feishu.sendNotification(id, message),
+    () => notice('飞书通知未送达，任务状态和结果仍保留在 Workbench。', 'error'),
+  );
+  active = {
+    conversationId: conversation.id,
+    messageId: assistant.id,
+    session,
+    readonly,
+    notifications,
+    requests: [],
+  };
   if (!readonly) browser.allowAgentControl();
   try {
     await session.send(text, context);
     if (assistant.status === 'streaming') assistant.status = 'done';
     if (session.sessionId) conversation.agentSessionId = session.sessionId;
-    return assistant.text;
+    return notifications.includesSecretInput
+      ? '本轮包含受保护的信息，请在 Workbench 查看结果。'
+      : assistant.text;
   } catch (error) {
     assistant.status = 'error';
     if (!assistant.text) assistant.text = error instanceof Error ? error.message : '任务未完成';
-    throw error;
+    notifications.handle({
+      type: 'error',
+      message: error instanceof Error ? error.message : '任务未完成',
+    });
+    throw notifications.includesSecretInput
+      ? new Error('本轮包含受保护的信息，请在 Workbench 查看执行详情。')
+      : error;
   } finally {
     if (session.sessionId) conversation.agentSessionId = session.sessionId;
     active = undefined;
@@ -186,6 +228,7 @@ async function runTurn(
     emit({
       type: 'agent:event',
       conversationId: conversation.id,
+      messageId: assistant.id,
       event: { type: 'status', status: 'idle' },
     });
   }
@@ -220,19 +263,22 @@ async function handleFeishuMessage(message: FeishuMessage) {
         item.remoteChatId === message.chatId && item.workspace === store.data.settings.workspace,
     ) || createConversation(`飞书 · ${message.text.slice(0, 22)}`);
   conversation.remoteChatId = message.chatId;
+  let reply: string;
   try {
-    const result = await runTurn(
-      conversation,
-      message.text,
-      `任务来自已配对的飞书用户。当前页面：${pageSource(browser.getState().url)}。仅在当前项目与浏览器范围内工作。`,
-      'feishu',
-    );
-    await feishu.sendReply(message, result || '任务结束，可在 Workbench 中查看结果。');
+    reply =
+      (await runTurn(
+        conversation,
+        message.text,
+        `任务来自已配对的飞书用户。当前页面：${pageSource(browser.getState().url)}。仅在当前项目与浏览器范围内工作。`,
+        'feishu',
+      )) || 'Agent 本轮已结束，可在 Workbench 中查看结果。';
   } catch (error) {
-    await feishu.sendReply(
-      message,
-      `任务未完成：${error instanceof Error ? error.message : '未知错误'}`,
-    );
+    reply = `任务未完成：${error instanceof Error ? error.message : '未知错误'}`;
+  }
+  try {
+    await feishu.sendReply(message, reply);
+  } catch {
+    notice('飞书结果未送达，执行结果仍保留在 Workbench。', 'error');
   }
 }
 async function createBrowserRuntime(binaryPath?: string) {
@@ -270,6 +316,7 @@ async function snapshot(): Promise<AppSnapshot> {
     conversations: store.data.conversations,
     recordings: store.data.recordings,
     browserFrame: lastFrame,
+    pendingRequests: active?.requests ?? [],
   };
 }
 async function invoke(action: string, payload: unknown) {
@@ -292,8 +339,32 @@ async function invoke(action: string, payload: unknown) {
       return true;
     case 'agent:approval': {
       const data = record(payload);
-      if (!active || typeof data.approved !== 'boolean') throw new Error('审批已失效');
-      await active.session.resolveApproval(string(data.id, 200), data.approved);
+      if (
+        !active ||
+        data.conversationId !== active.conversationId ||
+        data.messageId !== active.messageId ||
+        typeof data.approved !== 'boolean'
+      )
+        throw new Error('审批已失效');
+      await active.session.resolveApproval(string(data.id, 512), data.approved);
+      return true;
+    }
+    case 'agent:user-input': {
+      const data = record(payload);
+      if (
+        !active ||
+        data.conversationId !== active.conversationId ||
+        data.messageId !== active.messageId
+      )
+        throw new Error('问题已失效');
+      const answers = record(data.answers);
+      if (Object.keys(answers).length > 20) throw new Error('回答格式不正确');
+      const checked: Record<string, string[]> = Object.create(null);
+      for (const [id, values] of Object.entries(answers)) {
+        if (!Array.isArray(values) || values.length > 20) throw new Error('回答格式不正确');
+        checked[string(id, 200)] = values.map((value) => string(value, 20_000));
+      }
+      active.session.resolveUserInput(string(data.id, 512), checked);
       return true;
     }
     case 'settings:workspace': {

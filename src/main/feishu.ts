@@ -23,6 +23,7 @@ export interface FeishuConnectorOptions {
   storageDir: string;
   deferRestore?: boolean;
   restoreTimeoutMs?: number;
+  sendTimeoutMs?: number;
   encrypt: (text: string) => Promise<string>;
   decrypt: (text: string) => Promise<string>;
   onState: (state: FeishuState) => void;
@@ -602,24 +603,121 @@ export class FeishuConnector {
     if (!transport || this.state.status !== 'connected')
       throw new Error('飞书尚未连接，结果已保留在本机。');
     if (typeof text !== 'string' || !text.trim()) return;
+    await this.sendBoundMessage('reply', message.id, text, credentials, binding, transport);
+  }
+
+  async sendNotification(id: string, text: string): Promise<boolean> {
+    const credentials = this.credentials;
+    const binding = credentials?.binding;
+    const transport = this.transport;
+    // Notifications never unlock saved credentials or establish a connection as a side effect.
+    if (
+      this.disposed ||
+      !credentials ||
+      !binding ||
+      !transport ||
+      !this.state.paired ||
+      this.state.status !== 'connected'
+    )
+      return false;
+    if (typeof id !== 'string' || !id.trim() || id.length > 1024)
+      throw new Error('通知必须提供有效的稳定 ID。');
+    if (typeof text !== 'string' || !text.trim()) return false;
+    await this.sendBoundMessage('notification', id, text, credentials, binding, transport);
+    return true;
+  }
+
+  private async sendBoundMessage(
+    kind: 'reply' | 'notification',
+    id: string,
+    text: string,
+    credentials: Credentials,
+    binding: NonNullable<Credentials['binding']>,
+    transport: FeishuTransport,
+  ): Promise<void> {
+    const generation = this.generation;
+    const recipient = { ...binding };
+    const { appId, appSecret, domain } = credentials;
+    const routeChanged = new Error('飞书连接或配对已改变，停止发送结果。');
+    const timedOut = new Error('Feishu delivery timed out');
+    let active = true;
+    const checkRoute = () => {
+      if (
+        !active ||
+        this.disposed ||
+        generation !== this.generation ||
+        transport !== this.transport ||
+        this.credentials !== credentials ||
+        this.state.status !== 'connected' ||
+        !this.state.paired ||
+        credentials.appId !== appId ||
+        credentials.appSecret !== appSecret ||
+        credentials.domain !== domain ||
+        credentials.binding !== binding ||
+        binding.senderId !== recipient.senderId ||
+        binding.chatId !== recipient.chatId ||
+        binding.tenantKey !== recipient.tenantKey
+      )
+        throw routeChanged;
+    };
     const chunks = Array.from(text).reduce<string[]>((all, character) => {
       if (!all.length || all[all.length - 1].length >= 3_000) all.push('');
       all[all.length - 1] += character;
       return all;
     }, []);
-    for (let index = 0; index < chunks.length; index++) {
-      if (transport !== this.transport || this.credentials !== credentials)
-        throw new Error('飞书连接已改变，停止发送结果。');
-      const uuid = createHash('sha256')
-        .update(`${credentials.appId}:${message.id}:${text}:${index}`)
-        .digest('hex')
-        .slice(0, 32);
-      try {
-        await transport.send(message.chatId, chunks[index], uuid);
-      } catch {
-        this.update({ error: '飞书结果发送失败；结果仍保留在本机，请检查连接与发送消息权限。' });
-        throw new Error('Feishu reply could not be delivered');
+    const requestedTimeout = this.options.sendTimeoutMs ?? 15_000;
+    const timeoutMs =
+      Number.isFinite(requestedTimeout) && requestedTimeout > 0
+        ? Math.min(requestedTimeout, 15_000)
+        : 15_000;
+    let timer!: ReturnType<typeof setTimeout>;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        active = false;
+        reject(timedOut);
+      }, timeoutMs);
+    });
+    const sending = (async () => {
+      for (let index = 0; index < chunks.length; index++) {
+        checkRoute();
+        const uuid = createHash('sha256')
+          .update(
+            JSON.stringify([
+              appId,
+              recipient.senderId,
+              recipient.chatId,
+              recipient.tenantKey ?? '',
+              kind,
+              id,
+              text,
+              index,
+            ]),
+          )
+          .digest('hex')
+          .slice(0, 32);
+        await transport.send(recipient.chatId, chunks[index], uuid);
+        checkRoute();
       }
+    })();
+    try {
+      await Promise.race([sending, deadline]);
+    } catch (error) {
+      const label = kind === 'notification' ? '通知' : '结果';
+      if (error === timedOut) {
+        this.update({
+          error: `飞书${label}发送超时，送达状态未知；内容保留在本机，请先检查飞书再重试。`,
+        });
+        throw timedOut;
+      }
+      if (error === routeChanged) {
+        this.update({ error: `飞书连接或配对已改变，${label}发送已停止；已发送的分片无法撤回。` });
+        throw routeChanged;
+      }
+      this.update({ error: `飞书${label}发送失败；内容仍保留在本机，请检查连接与发送消息权限。` });
+      throw new Error(`Feishu ${kind} could not be delivered`);
+    } finally {
+      active = false;
+      clearTimeout(timer);
     }
   }
 

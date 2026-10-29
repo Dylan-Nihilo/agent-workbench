@@ -23,6 +23,7 @@ const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
 const event = (method, params) => send({method, params});
 let turn = 0, current, mode;
 const finish = (status='completed', error) => event('turn/completed', {threadId:'thread-1',turn:{id:current,status,items:[],error}});
+process.on('SIGTERM', () => setTimeout(() => process.exit(0), 30));
 readline.createInterface({input:process.stdin}).on('line', line => {
   const request = JSON.parse(line); fs.appendFileSync(log, line+'\\n');
   const p = request.params || {};
@@ -36,7 +37,22 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     if(mode==='fail') return finish('failed',{message:'model unavailable'});
     if(mode==='exit') return process.exit(7);
     if(mode==='cancel') return;
-    if(mode==='approval') return send({id:100,method:'item/commandExecution/requestApproval',params:{threadId:'thread-1',turnId:current,itemId:'command-1',command:'touch example.txt',cwd:${JSON.stringify(directory)}}});
+    if(mode==='approval'||mode==='approval-retracted') {
+      send({id:100,method:'item/commandExecution/requestApproval',params:{threadId:'thread-1',turnId:current,itemId:'command-1',command:'touch example.txt',cwd:${JSON.stringify(directory)}}});
+      if(mode==='approval-retracted') { event('serverRequest/resolved',{threadId:'thread-1',requestId:100}); finish(); }
+      return;
+    }
+    if(mode.startsWith('question')) {
+      const questions=[
+        {id:'route',header:'路径',question:'请选择实现路径',options:[{label:'Small',description:'最小实现'},{label:'Full',description:'完整实现'}],isOther:mode==='question-other'},
+        {id:'note',header:'备注',question:'请输入补充说明',isSecret:mode==='question-secret',options:null}
+      ];
+      if(mode==='question-malformed') questions[1].id='route';
+      send({id:110,method:'item/tool/requestUserInput',params:{threadId:mode==='question-foreign'?'another-thread':'thread-1',turnId:current,itemId:'question-1',isBlocking:true,autoResolutionMs:1,questions}});
+      if(mode==='question-retracted') { event('serverRequest/resolved',{threadId:'thread-1',requestId:110}); finish(); }
+      if(mode==='question-foreign-resolved') event('serverRequest/resolved',{threadId:'another-thread',requestId:110});
+      return;
+    }
     if(mode==='tool'||mode==='unknown'||mode==='pending-tool') return send({id:101,method:'item/tool/call',params:{threadId:'thread-1',turnId:current,callId:'tool-1',tool:mode==='unknown'?'read_secret':'browser_snapshot',arguments:{}}});
     event('item/agentMessage/delta',{threadId:'thread-1',turnId:current,itemId:'message-'+turn,delta:'Hello'});
     event('item/agentMessage/delta',{threadId:'thread-1',turnId:current,itemId:'message-'+turn,delta:' world'});
@@ -44,7 +60,8 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     return finish();
   }
   if(request.method==='turn/interrupt') { send({id:request.id,result:{}}); return finish('interrupted'); }
-  if(request.id===100 && 'result' in request) { event('item/agentMessage/delta',{threadId:'thread-1',turnId:current,itemId:'approval-result',delta:request.result.decision}); return finish(); }
+  if(request.id===100 && 'result' in request) { event('serverRequest/resolved',{threadId:'thread-1',requestId:100}); event('item/agentMessage/delta',{threadId:'thread-1',turnId:current,itemId:'approval-result',delta:request.result.decision}); return finish(); }
+  if(request.id===110 && ('result' in request || 'error' in request)) { event('serverRequest/resolved',{threadId:'thread-1',requestId:110}); event('item/agentMessage/delta',{threadId:'thread-1',turnId:current,itemId:'input-result',delta:'Answers handled'}); return finish(); }
   if(request.id===101 && 'result' in request && mode!=='pending-tool') { event('item/agentMessage/delta',{threadId:'thread-1',turnId:current,itemId:'tool-result',delta:request.result.success?'tool succeeded':'tool rejected'}); return finish(); }
 });
 `;
@@ -64,9 +81,9 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   };
 }
 
-async function waitFor(predicate: () => boolean) {
+async function waitFor(predicate: () => boolean | Promise<boolean>) {
   const deadline = Date.now() + 3000;
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() > deadline) throw new Error('Timed out waiting for protocol event');
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
@@ -122,6 +139,7 @@ test('structured streaming uses existing CLI and restrictive per-process configu
   assert.equal(start.model, undefined);
   assert.deepEqual(start.config.mcp_servers, {});
   assert.equal(start.config.features.plugins, false);
+  assert.equal(start.config.features.default_mode_request_user_input, true);
   assert.equal(start.dynamicTools[0].type, 'function');
   assert.match(
     requests.find((request) => request.method === 'turn/start').params.input[0].text,
@@ -196,6 +214,213 @@ test('command approval waits for an explicit decision and declines correctly', a
     'decline',
   );
   assert.throws(() => agent.resolveApproval(approval.request.id, true), /不存在/);
+  assert.equal(
+    events.filter((event) => event.type === 'request-resolved' && event.id === approval.request.id)
+      .length,
+    1,
+    'The local answer and server acknowledgement must not resolve the UI request twice',
+  );
+});
+
+test('questions wait for an explicit validated answer and use the app-server answer envelope', async (t) => {
+  const f = await fixture();
+  const events: AgentEvent[] = [];
+  const agent = session(f, events);
+  t.after(() => {
+    agent.close();
+    return f.cleanup();
+  });
+  const sent = agent.send('question');
+  await waitFor(() => events.some((event) => event.type === 'user-input'));
+  const input = events.find((event) => event.type === 'user-input');
+  assert.ok(input && input.type === 'user-input');
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(
+    (await f.requests()).some((request) => request.id === 110 && request.result),
+    false,
+  );
+  assert.throws(
+    () => agent.resolveUserInput('wrong-request', { route: ['Small'], note: ['ok'] }),
+    /不存在/,
+  );
+  assert.throws(() => agent.resolveUserInput(input.request.id, { route: ['Small'] }), /每一个/);
+  assert.throws(
+    () =>
+      agent.resolveUserInput(input.request.id, { route: ['Small'], note: ['ok'], extra: ['x'] }),
+    /未知/,
+  );
+  assert.throws(
+    () => agent.resolveUserInput(input.request.id, { route: ['Unknown'], note: ['ok'] }),
+    /选项/,
+  );
+  assert.throws(
+    () =>
+      agent.resolveUserInput(input.request.id, { route: ['Small'], note: ['x'.repeat(20_001)] }),
+    /最多/,
+  );
+  assert.throws(
+    () => agent.resolveUserInput(input.request.id, { route: ['Small', 'Small'], note: ['ok'] }),
+    /不重复/,
+  );
+  input.request.questions[0].isOther = true;
+  assert.throws(
+    () => agent.resolveUserInput(input.request.id, { route: ['Mutated'], note: ['ok'] }),
+    /选项/,
+    'UI event mutation must not change the validation policy',
+  );
+  agent.resolveUserInput(input.request.id, { route: ['Small'], note: ['用户提供的补充说明'] });
+  await sent;
+  const reply = (await f.requests()).find((request) => request.id === 110 && request.result);
+  assert.deepEqual(reply.result, {
+    answers: { route: { answers: ['Small'] }, note: { answers: ['用户提供的补充说明'] } },
+  });
+  assert.equal(
+    events.filter((event) => event.type === 'request-resolved' && event.id === input.request.id)
+      .length,
+    1,
+  );
+  assert.throws(
+    () => agent.resolveUserInput(input.request.id, { route: ['Small'], note: ['late'] }),
+    /不存在/,
+  );
+});
+
+test('explicit Other questions accept free text and secret answers never enter events', async (t) => {
+  for (const mode of ['question-other', 'question-secret']) {
+    const f = await fixture();
+    const events: AgentEvent[] = [];
+    const agent = session(f, events);
+    t.after(() => {
+      agent.close();
+      return f.cleanup();
+    });
+    const sent = agent.send(mode);
+    await waitFor(() => events.some((event) => event.type === 'user-input'));
+    const input = events.find((event) => event.type === 'user-input');
+    assert.ok(input && input.type === 'user-input');
+    const answer = mode === 'question-secret' ? 'FAKE_SECRET_VALUE_NOT_FOR_LOGS' : '自由补充说明';
+    assert.equal(input.request.questions[1].isSecret, mode === 'question-secret');
+    assert.equal(input.request.questions[0].isOther, mode === 'question-other');
+    agent.resolveUserInput(input.request.id, {
+      route: [mode === 'question-other' ? 'Custom approach' : 'Full'],
+      note: [answer],
+    });
+    await sent;
+    assert.equal(JSON.stringify(events).includes(answer), false);
+  }
+});
+
+test('server withdrawal resolves approvals and questions without an invented response', async (t) => {
+  for (const mode of ['approval-retracted', 'question-retracted']) {
+    const f = await fixture();
+    const events: AgentEvent[] = [];
+    const agent = session(f, events);
+    t.after(() => {
+      agent.close();
+      return f.cleanup();
+    });
+    await agent.send(mode);
+    const request = events.find(
+      (event) => event.type === 'approval' || event.type === 'user-input',
+    );
+    assert.ok(request && (request.type === 'approval' || request.type === 'user-input'));
+    assert.equal(
+      events.filter((event) => event.type === 'request-resolved' && event.id === request.request.id)
+        .length,
+      1,
+    );
+    if (request.type === 'approval')
+      assert.throws(() => agent.resolveApproval(request.request.id, true), /不存在/);
+    else
+      assert.throws(
+        () => agent.resolveUserInput(request.request.id, { route: ['Full'], note: ['late'] }),
+        /不存在/,
+      );
+    const rpcId = mode === 'approval-retracted' ? 100 : 110;
+    assert.equal(
+      (await f.requests()).some((message) => message.id === rpcId && message.result),
+      false,
+    );
+  }
+});
+
+test('foreign-thread resolution cannot remove the active question', async (t) => {
+  const f = await fixture();
+  const events: AgentEvent[] = [];
+  const agent = session(f, events);
+  t.after(() => {
+    agent.close();
+    return f.cleanup();
+  });
+  const sent = agent.send('question-foreign-resolved');
+  await waitFor(() => events.some((event) => event.type === 'user-input'));
+  const input = events.find((event) => event.type === 'user-input');
+  assert.ok(input && input.type === 'user-input');
+  assert.equal(
+    events.some((event) => event.type === 'request-resolved'),
+    false,
+  );
+  agent.resolveUserInput(input.request.id, { route: ['Small'], note: ['ok'] });
+  await sent;
+});
+
+test('malformed and foreign-thread questions never reach the UI', async (t) => {
+  for (const mode of ['question-malformed', 'question-foreign']) {
+    const f = await fixture();
+    const events: AgentEvent[] = [];
+    const agent = session(f, events);
+    t.after(() => {
+      agent.close();
+      return f.cleanup();
+    });
+    await agent.send(mode);
+    assert.equal(
+      events.some((event) => event.type === 'user-input'),
+      false,
+    );
+    const reply = (await f.requests()).find((request) => request.id === 110);
+    if (mode === 'question-malformed') assert.equal(reply.error.code, -32602);
+    else assert.deepEqual(reply.result, { answers: {} });
+  }
+});
+
+test('interrupt and close clear pending questions with empty answers and no successful completion', async (t) => {
+  for (const operation of ['interrupt', 'close'] as const) {
+    const f = await fixture();
+    const events: AgentEvent[] = [];
+    const agent = session(f, events);
+    t.after(() => {
+      agent.close();
+      return f.cleanup();
+    });
+    const stopped = assert.rejects(
+      agent.send('question'),
+      operation === 'close' ? /已关闭/ : /已停止/,
+    );
+    await waitFor(() => events.some((event) => event.type === 'user-input'));
+    const input = events.find((event) => event.type === 'user-input');
+    assert.ok(input && input.type === 'user-input');
+    await agent[operation]();
+    await stopped;
+    await waitFor(async () =>
+      (await f.requests()).some((request) => request.id === 110 && request.result),
+    );
+    const reply = (await f.requests()).find((request) => request.id === 110 && request.result);
+    assert.deepEqual(reply.result, { answers: {} });
+    assert.equal(
+      events.filter((event) => event.type === 'request-resolved' && event.id === input.request.id)
+        .length,
+      1,
+    );
+    assert.equal(
+      events.some((event) => event.type === 'complete'),
+      false,
+    );
+    assert.throws(
+      () => agent.resolveUserInput(input.request.id, { route: ['Full'], note: ['late'] }),
+      /不存在/,
+    );
+  }
 });
 
 test('failed and canceled turns reject and never emit a successful completion', async (t) => {

@@ -28,17 +28,18 @@ import {
   X,
 } from 'lucide-react';
 import { BrowserPane } from './BrowserPane';
+import { RequestPanel } from './RequestPanel';
 import type {
   AgentInfo,
   AppEvent,
   AppSnapshot,
-  ApprovalRequest,
   BrowserFrame,
   BrowserState,
   ChatMessage,
   Conversation,
   ElementRef,
   FeishuState,
+  PendingAgentRequest,
   RecordedStep,
   Recording,
   Settings,
@@ -174,7 +175,7 @@ export default function App() {
   const [settingsTab, setSettingsTab] = useState<SettingsTab | null>(null);
   const [agentMenu, setAgentMenu] = useState(false);
   const [statusLabel, setStatusLabel] = useState('正在思考');
-  const [approval, setApproval] = useState<ApprovalRequest>();
+  const [pendingRequests, setPendingRequests] = useState<PendingAgentRequest[]>([]);
   const [toast, setToast] = useState<{ text: string; error: boolean }>();
   const [refreshing, setRefreshing] = useState(false);
   const [connecting, setConnecting] = useState(false);
@@ -230,6 +231,7 @@ export default function App() {
     let disposed = false;
     let browserUpdated = false;
     let feishuUpdated = false;
+    let requestsUpdated = false;
     const handle = (event: AppEvent) => {
       if (event.type === 'browser:frame') lastFrame.current = event.frame;
       else if (event.type === 'browser:state') {
@@ -282,8 +284,44 @@ export default function App() {
                 idle: '',
               }[agentEvent.status],
           );
-        if (agentEvent.type === 'approval') setApproval(agentEvent.request);
-        if (agentEvent.type === 'complete' || agentEvent.type === 'error') setApproval(undefined);
+        if (agentEvent.type === 'approval' || agentEvent.type === 'user-input') {
+          requestsUpdated = true;
+          const pending: PendingAgentRequest =
+            agentEvent.type === 'approval'
+              ? {
+                  conversationId: event.conversationId,
+                  messageId: event.messageId,
+                  kind: 'approval',
+                  request: agentEvent.request,
+                }
+              : {
+                  conversationId: event.conversationId,
+                  messageId: event.messageId,
+                  kind: 'input',
+                  request: agentEvent.request,
+                };
+          setPendingRequests((previous) => [
+            ...previous.filter(
+              (item) =>
+                item.messageId !== event.messageId || item.request.id !== pending.request.id,
+            ),
+            pending,
+          ]);
+        }
+        if (
+          agentEvent.type === 'request-resolved' ||
+          agentEvent.type === 'complete' ||
+          agentEvent.type === 'error'
+        ) {
+          requestsUpdated = true;
+          setPendingRequests((previous) =>
+            previous.filter(
+              (item) =>
+                item.messageId !== event.messageId ||
+                (agentEvent.type === 'request-resolved' && item.request.id !== agentEvent.id),
+            ),
+          );
+        }
         setConversations((previous) =>
           previous.map((item) => {
             if (item.id !== event.conversationId) return item;
@@ -321,6 +359,7 @@ export default function App() {
         setAgents(snapshot.agents);
         if (!browserUpdated) setBrowser(snapshot.browser);
         if (!feishuUpdated) setFeishu(snapshot.feishu);
+        if (!requestsUpdated) setPendingRequests(snapshot.pendingRequests ?? []);
         setConversations(snapshot.conversations);
         setRecordings(snapshot.recordings);
         setConversationId(snapshot.conversations[0]?.id);
@@ -693,34 +732,18 @@ export default function App() {
               )}
             </div>
             <div className="composer-area">
-              {approval && (
-                <div className="approval-card">
-                  <div>
-                    <ShieldCheck size={17} />
-                    <strong>{approval.title}</strong>
-                  </div>
-                  <pre>{approval.detail}</pre>
-                  <div className="button-row">
-                    <button
-                      className="secondary-button"
-                      onClick={() => {
-                        void action('agent:approval', { id: approval.id, approved: false });
-                        setApproval(undefined);
-                      }}
-                    >
-                      拒绝
-                    </button>
-                    <button
-                      className="primary-button"
-                      onClick={() => {
-                        void action('agent:approval', { id: approval.id, approved: true });
-                        setApproval(undefined);
-                      }}
-                    >
-                      允许这次操作
-                    </button>
-                  </div>
-                </div>
+              {pendingRequests[0] && (
+                <RequestPanel
+                  key={`${pendingRequests[0].messageId}:${pendingRequests[0].request.id}`}
+                  pending={pendingRequests[0]}
+                  taskTitle={
+                    conversations.find((item) => item.id === pendingRequests[0].conversationId)
+                      ?.title || '当前任务'
+                  }
+                  onRespond={action}
+                  onStop={() => void action('conversation:stop')}
+                  onShowTask={() => setConversationId(pendingRequests[0].conversationId)}
+                />
               )}
               <div className={`composer ${busy ? 'is-busy' : ''}`}>
                 {selected && (
@@ -1119,8 +1142,8 @@ export default function App() {
                     <h4>{feishu.paired ? '飞书已准备好' : '连接已建立，再完成一次配对'}</h4>
                     {feishu.paired ? (
                       <p>
-                        在与机器人的私聊中描述任务。保持 Mac 在线，Workbench
-                        会在这里执行并回复结果。
+                        可在私聊中发起任务。桌面和飞书任务结束、失败或需要你回答、审核时，
+                        机器人会通知你。请保持 Mac 在线；回答与审批在 Workbench 中完成。
                       </p>
                     ) : (
                       <>

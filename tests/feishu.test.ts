@@ -5,7 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { EventDispatcher } from '@larksuiteoapi/node-sdk';
-import { FeishuConnector, type FeishuDependencies } from '../src/main/feishu.ts';
+import {
+  FeishuConnector,
+  type FeishuConnectorOptions,
+  type FeishuDependencies,
+} from '../src/main/feishu.ts';
 import type { FeishuMessage, FeishuState } from '../src/shared/types';
 
 const APP_ID = 'cli_0123456789abcdef';
@@ -62,7 +66,10 @@ function postEvent(id: string, content: unknown) {
   return value;
 }
 
-async function harness(onMessage: (message: FeishuMessage) => Promise<void> = async () => {}) {
+async function harness(
+  onMessage: (message: FeishuMessage) => Promise<void> = async () => {},
+  overrides: Partial<FeishuConnectorOptions> = {},
+) {
   const storageDir = await mkdtemp(path.join(os.tmpdir(), 'workbench-feishu-test-'));
   const key = randomBytes(32);
   const encrypt = async (text: string) => {
@@ -87,6 +94,9 @@ async function harness(onMessage: (message: FeishuMessage) => Promise<void> = as
   let connections = 0;
   let registrations = 0;
   let closes = 0;
+  let transportCredentials!: Parameters<FeishuDependencies['createTransport']>[0];
+  let sendHook:
+    ((message: { chatId: string; text: string; uuid: string }) => Promise<void>) | undefined;
   const dependencies: FeishuDependencies = {
     registerApp: (options) => {
       registrations++;
@@ -101,7 +111,8 @@ async function harness(onMessage: (message: FeishuMessage) => Promise<void> = as
       });
     },
     qrCode: async () => 'data:image/png;base64,fixture',
-    createTransport(_credentials, handlers) {
+    createTransport(credentials, handlers) {
+      transportCredentials = credentials;
       callbacks = handlers;
       connections++;
       return {
@@ -112,18 +123,20 @@ async function harness(onMessage: (message: FeishuMessage) => Promise<void> = as
           closes++;
         },
         send: async (chatId, text, uuid) => {
+          if (sendHook) await sendHook({ chatId, text, uuid });
           if (sendFailure) throw new Error('private upstream token must not escape');
           sent.push({ chatId, text, uuid });
         },
       };
     },
   };
-  const options = {
+  const options: FeishuConnectorOptions = {
     storageDir,
     encrypt,
     decrypt,
     onMessage,
     onState: (state: FeishuState) => states.push(state),
+    ...overrides,
   };
   const connector = new FeishuConnector(options, dependencies);
   return {
@@ -148,6 +161,12 @@ async function harness(onMessage: (message: FeishuMessage) => Promise<void> = as
     },
     get closes() {
       return closes;
+    },
+    get transportCredentials() {
+      return transportCredentials;
+    },
+    setSendHook(hook: typeof sendHook) {
+      sendHook = hook;
     },
     setSendFailure(value: boolean) {
       sendFailure = value;
@@ -862,6 +881,244 @@ test('cancelled registration cannot install credentials or create a connection',
     assert.equal(h.connections, 0);
     assert.equal(h.connector.getState().appId, undefined);
     assert.equal(h.connector.getState().status, 'disconnected');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('notifications do not restore credentials, decrypt or connect when unavailable', async () => {
+  let decryptCalls = 0;
+  const h = await harness(undefined, {
+    deferRestore: true,
+    decrypt: async () => {
+      decryptCalls++;
+      throw new Error('must not decrypt');
+    },
+  });
+  try {
+    const before = h.connector.getState();
+    assert.equal(await h.connector.sendNotification('desktop-1', '任务结束'), false);
+    assert.deepEqual(h.connector.getState(), before);
+    assert.equal(decryptCalls, 0);
+    assert.equal(h.connections, 0);
+    assert.equal(h.sent.length, 0);
+    assert.equal(h.registrations, 0);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('notifications return false for an unpaired or disconnected connector', async () => {
+  const h = await harness();
+  try {
+    await h.connector.configure({ appId: APP_ID, appSecret: SECRET });
+    await h.connector.connect();
+    assert.equal(h.connector.getState().paired, false);
+    assert.equal(await h.connector.sendNotification('unpaired', '任务结束'), false);
+    assert.equal(h.sent.length, 0);
+    await h.callbacks.onMessage(event('pair-1', h.connector.getState().pairingCode!));
+    await until(() => h.sent.length === 1);
+    h.connector.disconnect();
+    const connections = h.connections;
+    assert.equal(await h.connector.sendNotification('disconnected', '任务结束'), false);
+    assert.equal(h.connections, connections);
+    assert.equal(h.sent.length, 1);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('desktop notifications only use the paired chat and do not require or add an inbox item', async () => {
+  const h = await harness();
+  try {
+    await h.connectAndPair();
+    const files = (await readdir(path.join(h.storageDir, 'inbox')))
+      .filter((name) => name.endsWith('.enc'))
+      .sort();
+    assert.equal(
+      await h.connector.sendNotification('desktop-task-not-in-inbox', '任务已完成'),
+      true,
+    );
+    assert.deepEqual(
+      h.sent.slice(1).map((message) => [message.chatId, message.text]),
+      [[CHAT, '任务已完成']],
+    );
+    assert.deepEqual(
+      (await readdir(path.join(h.storageDir, 'inbox')))
+        .filter((name) => name.endsWith('.enc'))
+        .sort(),
+      files,
+    );
+    assert.equal(await h.connector.sendNotification('empty', '   '), false);
+    await assert.rejects(h.connector.sendNotification('', '任务已完成'), /ID/);
+    await assert.rejects(
+      h.connector.sendReply(
+        {
+          id: 'desktop-task-not-in-inbox',
+          text: 'invented',
+          senderId: OWNER,
+          chatId: CHAT,
+          timestamp: Date.now(),
+        },
+        'result',
+      ),
+      /原始会话/,
+    );
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('notification chunks retain stable UUIDs across retries and reconnects', async () => {
+  const h = await harness();
+  try {
+    await h.connectAndPair();
+    const text = '测试🙂'.repeat(1800);
+    assert.equal(await h.connector.sendNotification('desktop-result', text), true);
+    const first = h.sent.slice(1);
+    assert(first.length > 1);
+    assert.equal(first.map((message) => message.text).join(''), text);
+    assert(first.every((message) => message.chatId === CHAT && message.text.length <= 3001));
+    assert.equal(new Set(first.map((message) => message.uuid)).size, first.length);
+    h.connector.disconnect();
+    await h.connector.connect();
+    assert.equal(await h.connector.sendNotification('desktop-result', text), true);
+    assert.deepEqual(
+      h.sent.slice(1 + first.length).map((message) => message.uuid),
+      first.map((message) => message.uuid),
+    );
+    assert.equal(await h.connector.sendNotification('another-result', text), true);
+    assert.notEqual(h.sent.at(-1)!.uuid, first.at(-1)!.uuid);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('notification delivery freezes the binding, including in-place changes between chunks', async () => {
+  const h = await harness();
+  try {
+    await h.connectAndPair();
+    h.connector.disconnect();
+    await h.connector.connect();
+    const text = 'x'.repeat(6500);
+    h.setSendHook(async () => {
+      h.transportCredentials.binding!.chatId = 'oc_changed';
+    });
+    await assert.rejects(h.connector.sendNotification('route-change', text), /连接或配对已改变/);
+    assert.equal(h.sent.length, 2, 'Only the already-dispatched first chunk may be sent');
+    assert.equal(h.sent[1].chatId, CHAT);
+    assert.match(h.connector.getState().error!, /配对已改变/);
+    const originalUuid = h.sent[1].uuid;
+    h.setSendHook(undefined);
+    assert.equal(await h.connector.sendNotification('route-change', text), true);
+    assert.equal(h.sent[2].chatId, 'oc_changed');
+    assert.notEqual(
+      h.sent[2].uuid,
+      originalUuid,
+      'A changed binding must have a distinct deduplication key',
+    );
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('notifications stop after the transport changes while a chunk is in flight', async () => {
+  const h = await harness();
+  let release!: () => void;
+  let started = false;
+  try {
+    await h.connectAndPair();
+    h.setSendHook(async () => {
+      started = true;
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    });
+    const pending = h.connector.sendNotification('disconnect-in-flight', 'x'.repeat(6500));
+    const rejected = assert.rejects(pending, /连接或配对已改变/);
+    await until(() => started);
+    h.connector.disconnect();
+    release();
+    await rejected;
+    assert.equal(h.sent.length, 2);
+    assert.equal(h.sent[1].chatId, CHAT);
+    assert.equal(h.connector.getState().status, 'disconnected');
+    assert.match(h.connector.getState().error!, /发送已停止/);
+  } finally {
+    release?.();
+    await h.cleanup();
+  }
+});
+
+test('notification send failures reject, expose a safe desktop error and preserve retry UUIDs', async () => {
+  const h = await harness();
+  const attempts: string[] = [];
+  try {
+    await h.connectAndPair();
+    h.setSendHook(async (message) => {
+      attempts.push(message.uuid);
+    });
+    h.setSendFailure(true);
+    await assert.rejects(
+      h.connector.sendNotification('failure', '任务结束'),
+      /could not be delivered/,
+    );
+    assert.match(h.connector.getState().error!, /通知发送失败/);
+    assert.equal(JSON.stringify(h.states).includes('private upstream token'), false);
+    h.setSendFailure(false);
+    assert.equal(await h.connector.sendNotification('failure', '任务结束'), true);
+    assert.equal(attempts[0], attempts[1]);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('notification timeout returns promptly and late transport completion cannot send more chunks', async () => {
+  const h = await harness(undefined, { sendTimeoutMs: 35 });
+  let release!: () => void;
+  try {
+    await h.connectAndPair();
+    h.setSendHook(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const start = Date.now();
+    await assert.rejects(h.connector.sendNotification('timeout', 'x'.repeat(6500)), /timed out/);
+    assert(Date.now() - start < 1000);
+    assert.match(h.connector.getState().error!, /发送超时，送达状态未知/);
+    const stateCount = h.states.length;
+    release();
+    await delay(20);
+    assert.equal(h.sent.length, 2, 'A late first chunk must not start the remaining chunks');
+    assert.equal(
+      h.states.length,
+      stateCount,
+      'Late completion must not overwrite the timeout result',
+    );
+  } finally {
+    release?.();
+    await h.cleanup();
+  }
+});
+
+test('notification deadline applies to the whole message instead of restarting per chunk', async () => {
+  const h = await harness(undefined, { sendTimeoutMs: 35 });
+  let attempts = 0;
+  try {
+    await h.connectAndPair();
+    h.setSendHook(async () => {
+      attempts++;
+      await delay(20);
+    });
+    await assert.rejects(
+      h.connector.sendNotification('total-deadline', 'x'.repeat(8500)),
+      /timed out/,
+    );
+    await delay(30);
+    assert(attempts < 3, 'The total deadline must prevent the third chunk');
+    assert.match(h.connector.getState().error!, /发送超时/);
   } finally {
     await h.cleanup();
   }
