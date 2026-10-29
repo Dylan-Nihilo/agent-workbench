@@ -165,16 +165,17 @@ export class BrowserRuntime {
     return result;
   }
 
-  start(): Promise<void> {
+  start(initialUrl?: string): Promise<void> {
     if (this.state.status === 'ready') return Promise.resolve();
     if (this.starting) return this.starting;
-    this.starting = this.startInternal().finally(() => {
+    this.starting = this.startInternal(initialUrl).finally(() => {
       this.starting = undefined;
     });
     return this.starting;
   }
 
-  private async startInternal(): Promise<void> {
+  private async startInternal(initialUrl?: string): Promise<void> {
+    const initial = initialUrl === undefined ? undefined : normalizeBrowserUrl(initialUrl);
     this.disposed = false;
     const binary = await discoverBrowserOS(this.options.binaryPath, this.options.storageDir);
     if (!binary) {
@@ -299,6 +300,15 @@ export class BrowserRuntime {
         void this.handlePopup(params.targetInfo);
       });
       await this.browser.call('Target.setDiscoverTargets', { discover: true });
+      if (initial !== undefined) {
+        // Startup is not a user action. Finish it before exposing a ready browser.
+        this.update({ url: initial, loading: true });
+        const navigation = await this.page.call('Page.navigate', { url: initial });
+        if (navigation.errorText) throw new Error(navigation.errorText);
+        await this.refreshPageState();
+        this.update({ status: 'ready', error: undefined });
+        return;
+      }
       this.update({
         status: 'ready',
         loading: false,

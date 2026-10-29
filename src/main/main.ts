@@ -604,8 +604,7 @@ async function launch() {
   window.show();
   if (window.isFocused()) restoreConnections();
   void browser
-    .start()
-    .then(() => browser.navigate(demoUrl))
+    .start(demoUrl)
     .catch((error) => notice(error instanceof Error ? error.message : '浏览器启动失败', 'error'));
   app.on('activate', () => window?.show());
 }

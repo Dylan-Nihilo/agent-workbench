@@ -46,6 +46,84 @@ test('diagnostic text removes common token and password patterns', () => {
 
 const binary = process.env.WORKBENCH_BROWSEROS_TEST_BINARY;
 test(
+  'real BrowserOS neo: initial navigation does not take control from an Agent',
+  { skip: !binary, timeout: 20_000 },
+  async () => {
+    const storageDir = await mkdtemp(join(tmpdir(), 'workbench-startup-test-'));
+    let requestArrived!: () => void;
+    let releaseInitial: (() => void) | undefined;
+    const requested = new Promise<void>((resolve) => {
+      requestArrived = resolve;
+    });
+    const fixture = createServer((request, response) => {
+      const reply = () => {
+        if (response.writableEnded) return;
+        response.setHeader('Content-Type', 'text/html; charset=utf-8');
+        response.end(`<!doctype html><title>Startup fixture</title><h1>${request.url}</h1>`);
+      };
+      if (request.url === '/initial') {
+        releaseInitial = reply;
+        requestArrived();
+      } else reply();
+    });
+    await new Promise<void>((resolve) => fixture.listen(0, '127.0.0.1', resolve));
+    const origin = `http://127.0.0.1:${(fixture.address() as { port: number }).port}`;
+    let takeovers = 0;
+    const runtime = new BrowserRuntime({
+      storageDir,
+      binaryPath: binary,
+      onState() {},
+      onFrame() {},
+      onStep() {},
+      onSelected() {},
+      onHumanTakeover: () => {
+        takeovers++;
+      },
+    });
+    let started: Promise<void> | undefined;
+    try {
+      started = runtime.start(`${origin}/initial`);
+      await Promise.race([requested, started]);
+      assert(releaseInitial, 'Startup must request the initial page');
+      const readyBeforeInitialResponse = runtime.getState().status === 'ready';
+      runtime.allowAgentControl();
+      releaseInitial!();
+      await started;
+      assert.equal(takeovers, 0, 'Automatic initial navigation must not notify human takeover');
+      assert.equal(
+        readyBeforeInitialResponse,
+        false,
+        'The browser must not advertise ready before its initial navigation',
+      );
+      assert.equal(runtime.getState().url, `${origin}/initial`);
+      assert(
+        !(await runtime.callTool('workbench_browser_navigate', { url: `${origin}/agent` })).isError,
+        'Startup must preserve Agent control',
+      );
+      assert.equal(takeovers, 0);
+      await runtime.navigate(`${origin}/manual`);
+      assert.equal(takeovers, 1, 'A genuine address change must still take control');
+      await runtime.start(`${origin}/initial`);
+      for (let i = 0; i < 100 && runtime.getState().url !== `${origin}/manual`; i++)
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(
+        runtime.getState().url,
+        `${origin}/manual`,
+        'An already-ready browser must not reload the startup URL',
+      );
+      assert(
+        (await runtime.callTool('workbench_browser_navigate', { url: `${origin}/agent` })).isError,
+      );
+    } finally {
+      releaseInitial?.();
+      await started?.catch(() => {});
+      await runtime.dispose();
+      await new Promise<void>((resolve) => fixture.close(() => resolve()));
+      await rm(storageDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  },
+);
+test(
   'real BrowserOS neo: history restoration keeps snapshots, recording and agent input usable',
   { skip: !binary, timeout: 40_000 },
   async () => {
