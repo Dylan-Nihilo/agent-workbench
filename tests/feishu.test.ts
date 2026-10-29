@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -54,6 +54,12 @@ function event(
       create_time: String(Date.now()),
     },
   };
+}
+
+function postEvent(id: string, content: unknown) {
+  const value = event(id, '', { messageType: 'post' });
+  value.message.content = JSON.stringify(content);
+  return value;
 }
 
 async function harness(onMessage: (message: FeishuMessage) => Promise<void> = async () => {}) {
@@ -185,6 +191,258 @@ test('configuration is encrypted and never exposed in state', async () => {
   }
 });
 
+test('restore has a deadline, preserves saved ciphertext, blocks replacement and discards late results', async () => {
+  const h = await harness();
+  let restored: FeishuConnector | undefined;
+  let releaseOld!: (value: string) => void;
+  try {
+    await h.connector.configure({ appId: APP_ID, appSecret: SECRET });
+    await h.connector.dispose();
+    const filename = path.join(h.storageDir, 'credentials.enc');
+    const ciphertext = await readFile(filename, 'utf8');
+    let unlocked = false;
+    restored = new FeishuConnector(
+      {
+        ...h.options,
+        restoreTimeoutMs: 40,
+        decrypt: (value) =>
+          unlocked
+            ? h.decrypt(value)
+            : new Promise<string>((resolve) => {
+                releaseOld = resolve;
+              }),
+      },
+      h.dependencies,
+    );
+    assert.equal(restored.getState().status, 'restoring');
+    const connecting = restored.connect();
+    await until(() => restored!.getState().hasSavedCredentials === true);
+    assert.equal(restored.getState().appId, undefined);
+    await assert.rejects(connecting, /超时/);
+    assert.equal(restored.getState().status, 'error');
+    assert.equal(restored.getState().hasSavedCredentials, true);
+    assert.match(restored.getState().error!, /原有加密文件未更改/);
+    await assert.rejects(
+      restored.configure({ appId: 'cli_fedcba9876543210', appSecret: 'replacement' }),
+      /恢复/,
+    );
+    await assert.rejects(restored.beginSetup(), /恢复/);
+    await assert.rejects(restored.connect(), /恢复/);
+    assert.equal(await readFile(filename, 'utf8'), ciphertext);
+    assert.equal(h.connections, 0);
+    assert.equal(h.registrations, 0);
+    unlocked = true;
+    const state = await restored.retryRestore();
+    assert.equal(state.status, 'disconnected');
+    assert.equal(state.appId, APP_ID);
+    assert.equal(state.hasSavedCredentials, true);
+    releaseOld(JSON.stringify({ appId: 'cli_fedcba9876543210', appSecret: 'late-result' }));
+    await delay(20);
+    assert.equal(restored.getState().appId, APP_ID);
+    assert.equal(restored.getState().error, undefined);
+    assert.equal(await readFile(filename, 'utf8'), ciphertext);
+    assert.equal(h.connections, 0);
+  } finally {
+    releaseOld?.('{}');
+    await restored?.dispose();
+    await h.cleanup();
+  }
+});
+
+test('deferred restoration waits for an explicit retry and restores the existing binding without connecting', async () => {
+  const h = await harness();
+  let restored: FeishuConnector | undefined;
+  try {
+    await h.connector.configure({ appId: APP_ID, appSecret: SECRET });
+    await h.connector.dispose();
+    await writeFile(
+      path.join(h.storageDir, 'credentials.enc'),
+      await h.options.encrypt(
+        JSON.stringify({
+          appId: APP_ID,
+          appSecret: SECRET,
+          binding: { senderId: OWNER, chatId: CHAT, tenantKey: TENANT },
+        }),
+      ),
+    );
+    let decryptCalls = 0;
+    restored = new FeishuConnector(
+      {
+        ...h.options,
+        deferRestore: true,
+        decrypt: async (value) => {
+          decryptCalls++;
+          return h.decrypt(value);
+        },
+      },
+      h.dependencies,
+    );
+    await delay(20);
+    assert.equal(decryptCalls, 0);
+    assert.equal(restored.getState().status, 'restoring');
+    const states = await Promise.all([restored.retryRestore(), restored.retryRestore()]);
+    assert.equal(decryptCalls, 1);
+    assert.equal(states[0].appId, APP_ID);
+    assert.equal(states[1].paired, true);
+    assert.equal(states[0].status, 'disconnected');
+    assert.equal(h.connections, 0);
+  } finally {
+    await restored?.dispose();
+    await h.cleanup();
+  }
+});
+
+test('decrypt errors cannot make an existing configuration look absent and retry remains available', async () => {
+  const h = await harness();
+  let restored: FeishuConnector | undefined;
+  try {
+    await h.connector.configure({ appId: APP_ID, appSecret: SECRET });
+    await h.connector.dispose();
+    const ciphertext = await readFile(path.join(h.storageDir, 'credentials.enc'), 'utf8');
+    let denied = true;
+    restored = new FeishuConnector(
+      {
+        ...h.options,
+        deferRestore: true,
+        decrypt: async (value) => {
+          if (denied)
+            throw Object.assign(new Error('private keychain details'), { code: 'ENOENT' });
+          return h.decrypt(value);
+        },
+      },
+      h.dependencies,
+    );
+    await assert.rejects(restored.retryRestore(), /无法恢复/);
+    assert.equal(restored.getState().hasSavedCredentials, true);
+    assert.equal(restored.disconnect().status, 'error');
+    assert.equal(JSON.stringify(h.states).includes('private keychain details'), false);
+    denied = false;
+    assert.equal((await restored.retryRestore()).appId, APP_ID);
+    assert.equal(await readFile(path.join(h.storageDir, 'credentials.enc'), 'utf8'), ciphertext);
+  } finally {
+    await restored?.dispose();
+    await h.cleanup();
+  }
+});
+
+test('file read failures expose recovery before the saved-credentials check completes', async () => {
+  const h = await harness();
+  let restored: FeishuConnector | undefined;
+  try {
+    await h.connector.dispose();
+    const filename = path.join(h.storageDir, 'credentials.enc');
+    await mkdir(filename);
+    restored = new FeishuConnector({ ...h.options, deferRestore: true }, h.dependencies);
+    await assert.rejects(restored.retryRestore(), /无法恢复/);
+    assert.equal(restored.getState().status, 'error');
+    assert.equal(restored.getState().hasSavedCredentials, undefined);
+    assert.equal(restored.getState().restoreFailed, true);
+    await assert.rejects(restored.beginSetup(), /恢复/);
+    await assert.rejects(restored.configure({ appId: APP_ID, appSecret: SECRET }), /恢复/);
+    assert.equal(h.registrations, 0);
+    await rm(filename, { recursive: true });
+    const state = await restored.retryRestore();
+    assert.equal(state.status, 'disconnected');
+    assert.equal(state.restoreFailed, false);
+    assert.equal(state.hasSavedCredentials, false);
+  } finally {
+    await restored?.dispose();
+    await h.cleanup();
+  }
+});
+
+test('inbox restoration is atomic and read-only even when an interrupted item decrypts after the deadline', async () => {
+  const h = await harness();
+  let restored: FeishuConnector | undefined;
+  let releaseOld!: (value: string) => void;
+  try {
+    await h.connector.configure({ appId: APP_ID, appSecret: SECRET });
+    const message: FeishuMessage = {
+      id: 'restore-inbox',
+      text: 'previous operation',
+      senderId: OWNER,
+      chatId: CHAT,
+      timestamp: Date.now(),
+    };
+    const inboxFile = path.join(
+      h.storageDir,
+      'inbox',
+      `${createHash('sha256').update(`${APP_ID}:${message.id}`).digest('hex')}.enc`,
+    );
+    await mkdir(path.dirname(inboxFile), { recursive: true });
+    const entry = { appId: APP_ID, message, kind: 'command', status: 'running' };
+    const inboxCiphertext = await h.options.encrypt(JSON.stringify(entry));
+    await writeFile(inboxFile, inboxCiphertext);
+    await h.connector.dispose();
+    let unlocked = false;
+    restored = new FeishuConnector(
+      {
+        ...h.options,
+        restoreTimeoutMs: 40,
+        decrypt: (value) =>
+          value === inboxCiphertext && !unlocked
+            ? new Promise<string>((resolve) => {
+                releaseOld = resolve;
+              })
+            : h.decrypt(value),
+      },
+      h.dependencies,
+    );
+    await assert.rejects(restored.connect(), /超时/);
+    assert.equal(restored.getState().hasSavedCredentials, true);
+    assert.equal(restored.getState().appId, undefined);
+    assert.equal(await readFile(inboxFile, 'utf8'), inboxCiphertext);
+    releaseOld(JSON.stringify(entry));
+    await delay(20);
+    assert.equal(restored.getState().status, 'error');
+    assert.equal(await readFile(inboxFile, 'utf8'), inboxCiphertext);
+    unlocked = true;
+    const state = await restored.retryRestore();
+    assert.equal(state.appId, APP_ID);
+    assert.match(state.error!, /上次中断/);
+    assert.equal(await readFile(inboxFile, 'utf8'), inboxCiphertext);
+  } finally {
+    releaseOld?.('{}');
+    await restored?.dispose();
+    await h.cleanup();
+  }
+});
+
+test('disposing during restoration stops the wait and ignores the eventual decrypted result', async () => {
+  const h = await harness();
+  let restored: FeishuConnector | undefined;
+  let release!: (value: string) => void;
+  try {
+    await h.connector.configure({ appId: APP_ID, appSecret: SECRET });
+    await h.connector.dispose();
+    restored = new FeishuConnector(
+      {
+        ...h.options,
+        deferRestore: true,
+        decrypt: () =>
+          new Promise<string>((resolve) => {
+            release = resolve;
+          }),
+      },
+      h.dependencies,
+    );
+    const pending = restored.retryRestore();
+    const rejection = assert.rejects(pending);
+    await until(() => typeof release === 'function');
+    await restored.dispose();
+    await rejection;
+    const stateCount = h.states.length;
+    release(JSON.stringify({ appId: APP_ID, appSecret: SECRET }));
+    await delay(20);
+    assert.equal(h.states.length, stateCount);
+    assert.equal(restored.getState().appId, undefined);
+  } finally {
+    release?.('{}');
+    await restored?.dispose();
+    await h.cleanup();
+  }
+});
+
 test('connection readiness and operator pairing remain separate states', async () => {
   const h = await harness();
   try {
@@ -293,6 +551,123 @@ test('acknowledgement does not wait for agent work and cancellation bypasses the
     await h.callbacks.onMessage(event('long-1', 'long task'));
     await until(() => received.includes('long task'));
     await h.callbacks.onMessage(event('cancel-1', '/cancel'));
+    await until(() => received.includes('/cancel'));
+    assert.deepEqual(received, ['long task', '/cancel']);
+  } finally {
+    release();
+    await h.cleanup();
+  }
+});
+
+test('post messages keep visible text and paragraphs through the actual SDK event dispatcher', async () => {
+  const received: FeishuMessage[] = [];
+  const h = await harness(async (message) => {
+    received.push(message);
+  });
+  try {
+    await h.connectAndPair();
+    const dispatcher = new EventDispatcher({
+      logger: { trace() {}, debug() {}, info() {}, warn() {}, error() {} },
+    }).register({
+      'im.message.receive_v1': (data) => h.callbacks.onMessage(data),
+    });
+    const post = postEvent('post-direct', {
+      title: '页面测试',
+      content: [
+        [
+          { tag: 'text', text: '先读取', style: ['bold'] },
+          { tag: 'a', text: '当前页面', href: 'javascript:must-not-execute' },
+        ],
+        [
+          { tag: 'text', text: '然后告诉我结果。' },
+          { tag: 'img', image_key: 'private-image-key' },
+          { tag: 'media', file_key: 'private-file-key' },
+        ],
+      ],
+    });
+    await dispatcher.invoke(
+      {
+        schema: '2.0',
+        header: {
+          app_id: APP_ID,
+          tenant_key: TENANT,
+          event_type: 'im.message.receive_v1',
+          event_id: 'post-event',
+          create_time: String(Date.now()),
+        },
+        event: { sender: post.sender, message: post.message },
+      },
+      { needCheck: false },
+    );
+    await until(() => received.length === 1);
+    assert.equal(received[0].text, '页面测试\n先读取当前页面\n然后告诉我结果。');
+    assert.equal(received[0].text.includes('private-'), false);
+    assert.equal(received[0].text.includes('javascript:'), false);
+    await h.callbacks.onMessage(post);
+    await delay(20);
+    assert.equal(received.length, 1);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('localized post messages are accepted while media-only, malformed and oversized posts are ignored', async () => {
+  const received: FeishuMessage[] = [];
+  const h = await harness(async (message) => {
+    received.push(message);
+  });
+  try {
+    await h.connectAndPair();
+    await h.callbacks.onMessage(
+      postEvent('post-localized', {
+        zh_cn: {
+          content: [
+            [{ tag: 'text', text: '查看页面' }],
+            [{ tag: 'code_block', language: 'text', text: '只读检查' }],
+          ],
+        },
+        en_us: { content: [[{ tag: 'text', text: 'Ignored alternate translation' }]] },
+      }),
+    );
+    await h.callbacks.onMessage(
+      postEvent('media-only', { content: [[{ tag: 'img', image_key: 'do-not-download' }]] }),
+    );
+    await h.callbacks.onMessage(
+      postEvent('malformed-post', { content: [{ tag: 'text', text: 'invalid paragraph' }] }),
+    );
+    await h.callbacks.onMessage(
+      postEvent('oversized-post', { content: [[{ tag: 'text', text: 'x'.repeat(20_001) }]] }),
+    );
+    await h.callbacks.onMessage(
+      postEvent('unknown-tag', { content: [[{ tag: 'script', text: 'must not run' }]] }),
+    );
+    await until(() => received.length === 1);
+    assert.equal(received[0].text, '查看页面\n只读检查');
+    await delay(20);
+    assert.equal(received.length, 1);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a cancellation sent as a rich-text post still bypasses a long-running command', async () => {
+  let release!: () => void;
+  const running = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const received: string[] = [];
+  const h = await harness(async (message) => {
+    received.push(message.text);
+    if (message.text === 'long task') await running;
+    if (message.text === '/cancel') release();
+  });
+  try {
+    await h.connectAndPair();
+    await h.callbacks.onMessage(event('post-long', 'long task'));
+    await until(() => received.includes('long task'));
+    await h.callbacks.onMessage(
+      postEvent('post-cancel', { content: [[{ tag: 'text', text: '/cancel' }]] }),
+    );
     await until(() => received.includes('/cancel'));
     assert.deepEqual(received, ['long task', '/cancel']);
   } finally {

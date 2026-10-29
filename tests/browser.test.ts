@@ -46,6 +46,142 @@ test('diagnostic text removes common token and password patterns', () => {
 
 const binary = process.env.WORKBENCH_BROWSEROS_TEST_BINARY;
 test(
+  'real BrowserOS neo: history restoration keeps snapshots, recording and agent input usable',
+  { skip: !binary, timeout: 40_000 },
+  async () => {
+    const storageDir = await mkdtemp(join(tmpdir(), 'workbench-history-test-'));
+    const serve = (name: string) =>
+      createServer((_request, response) => {
+        response.setHeader('Content-Type', 'text/html; charset=utf-8');
+        response.setHeader('Cache-Control', 'max-age=600');
+        response.end(
+          `<!doctype html><title>History ${name}</title><h1>Page ${name}</h1><label>Draft ${name}<input id="draft-${name}"></label><output id="restored">fresh</output><script>addEventListener('pageshow',event=>document.querySelector('#restored').textContent=event.persisted?'restored-from-bfcache':'fresh');</script>`,
+        );
+      });
+    const a = serve('A');
+    const b = serve('B');
+    await Promise.all(
+      [a, b].map(
+        (server) => new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve)),
+      ),
+    );
+    const urlA = `http://127.0.0.1:${(a.address() as { port: number }).port}/`;
+    const urlB = `http://localhost:${(b.address() as { port: number }).port}/`;
+    const observedSteps: RecordedStep[] = [];
+    const runtime = new BrowserRuntime({
+      storageDir,
+      binaryPath: binary,
+      onState() {},
+      onFrame() {},
+      onStep: (step) => observedSteps.push(step),
+      onSelected() {},
+      onHumanTakeover() {},
+    });
+    const snapshot = async () =>
+      JSON.parse((await runtime.snapshot()).text) as { text: string; elements: ElementRef[] };
+    const loaded = async (title: string) => {
+      for (let i = 0; i < 100; i++) {
+        const state = runtime.getState();
+        if (state.title === title && !state.loading) return;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
+      assert.fail(`History navigation did not finish: ${JSON.stringify(runtime.getState())}`);
+    };
+    try {
+      await runtime.start();
+      await runtime.navigate(urlA);
+      await loaded('History A');
+      const first = await snapshot();
+      runtime.allowAgentControl();
+      assert(
+        !(
+          await runtime.callTool('workbench_browser_fill', {
+            ref: first.elements[0].ref,
+            value: 'draft before leaving',
+          })
+        ).isError,
+      );
+      await runtime.navigate(urlB);
+      await loaded('History B');
+      const away = await snapshot();
+      await runtime.back();
+      await loaded('History A');
+      const restored = await snapshot();
+      assert(
+        restored.text.includes('restored-from-bfcache'),
+        'The regression must exercise BFCache, not a replacement reload',
+      );
+      assert.equal(restored.elements[0].value, 'draft before leaving');
+      runtime.startRecording();
+      runtime.allowAgentControl();
+      assert(
+        (
+          await runtime.callTool('workbench_browser_fill', {
+            ref: away.elements[0].ref,
+            value: 'wrong page',
+          })
+        ).isError,
+      );
+      assert(
+        !(
+          await runtime.callTool('workbench_browser_fill', {
+            ref: restored.elements[0].ref,
+            value: 'agent after back',
+          })
+        ).isError,
+      );
+      const bounds = restored.elements[0].bounds!;
+      const point = { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 };
+      await runtime.dispatchInput({ type: 'mouse', action: 'down', ...point });
+      await runtime.dispatchInput({ type: 'mouse', action: 'up', ...point });
+      await runtime.dispatchInput({ type: 'text', text: '-human' });
+      // Native input acknowledgement can precede the asynchronous recorder binding event.
+      for (
+        let i = 0;
+        i < 100 &&
+        !observedSteps.some(
+          (step) =>
+            step.source === 'human' && step.kind === 'fill' && step.value?.includes('-human'),
+        );
+        i++
+      )
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      const recording = runtime.stopRecording();
+      assert(
+        recording.steps.some(
+          (step) =>
+            step.kind === 'fill' && step.source === 'agent' && step.value === 'agent after back',
+        ),
+      );
+      assert(
+        recording.steps.some(
+          (step) =>
+            step.kind === 'fill' && step.source === 'human' && step.value?.includes('-human'),
+        ),
+      );
+      assert.equal(
+        recording.steps.filter(
+          (step) => step.kind === 'click' && step.target?.selector === '#draft-A',
+        ).length,
+        1,
+        'Restoring the bridge must not duplicate event listeners',
+      );
+      await runtime.forward();
+      await loaded('History B');
+      assert((await snapshot()).text.includes('restored-from-bfcache'));
+      await runtime.back();
+      await loaded('History A');
+      assert((await snapshot()).elements[0].value?.includes('-human'));
+    } finally {
+      await runtime.dispose();
+      await Promise.all(
+        [a, b].map((server) => new Promise<void>((resolve) => server.close(() => resolve()))),
+      );
+      await rm(storageDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  },
+);
+test(
   'real BrowserOS neo: embedded frames, tools, recording, inspection and stale references',
   { skip: !binary, timeout: 60_000 },
   async () => {

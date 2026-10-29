@@ -132,7 +132,9 @@ export interface Conversation {
   remoteChatId?: string;
 }
 export interface FeishuState {
-  status: 'disconnected' | 'configuring' | 'connecting' | 'connected' | 'error';
+  status: 'restoring' | 'disconnected' | 'configuring' | 'connecting' | 'connected' | 'error';
+  hasSavedCredentials?: boolean;
+  restoreFailed?: boolean;
   appId?: string;
   botName?: string;
   paired: boolean;

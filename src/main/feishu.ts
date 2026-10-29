@@ -21,6 +21,8 @@ interface InboxItem {
 
 export interface FeishuConnectorOptions {
   storageDir: string;
+  deferRestore?: boolean;
+  restoreTimeoutMs?: number;
   encrypt: (text: string) => Promise<string>;
   decrypt: (text: string) => Promise<string>;
   onState: (state: FeishuState) => void;
@@ -94,6 +96,36 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const errorCode = (error: unknown) =>
   isRecord(error) && typeof error.code === 'string' ? error.code : '';
 
+function messageText(type: unknown, content: unknown): string | undefined {
+  if (!isRecord(content)) return;
+  if (type === 'text') return typeof content.text === 'string' ? content.text.trim() : undefined;
+  if (type !== 'post') return;
+  // Feishu receives direct post bodies; the official SDK also accepts locale-wrapped bodies.
+  const body = Array.isArray(content.content)
+    ? content
+    : ['zh_cn', 'en_us', 'ja_jp']
+        .map((locale) => content[locale])
+        .find((value) => isRecord(value) && Array.isArray(value.content));
+  if (!isRecord(body) || !Array.isArray(body.content)) return;
+  const lines = typeof body.title === 'string' && body.title ? [body.title] : [];
+  for (const paragraph of body.content) {
+    if (!Array.isArray(paragraph)) return;
+    let line = '';
+    for (const element of paragraph) {
+      if (!isRecord(element)) return;
+      // Do not fetch media, expose resource keys or execute link targets/embedded content.
+      if (
+        typeof element.tag === 'string' &&
+        ['text', 'a', 'md', 'code_block'].includes(element.tag) &&
+        typeof element.text === 'string'
+      )
+        line += element.text;
+    }
+    lines.push(line);
+  }
+  return lines.join('\n').trim();
+}
+
 function parseMessage(
   event: unknown,
   appId: string,
@@ -112,14 +144,15 @@ function parseMessage(
   if (
     sender.sender_type !== 'user' ||
     message.chat_type !== 'p2p' ||
-    message.message_type !== 'text'
+    (message.message_type !== 'text' && message.message_type !== 'post')
   )
     return;
   if (!isRecord(sender.sender_id) || typeof sender.sender_id.open_id !== 'string') return;
   if (
     typeof message.message_id !== 'string' ||
     typeof message.chat_id !== 'string' ||
-    typeof message.content !== 'string'
+    typeof message.content !== 'string' ||
+    message.content.length > 100_000
   )
     return;
   let content: unknown;
@@ -128,8 +161,7 @@ function parseMessage(
   } catch {
     return;
   }
-  if (!isRecord(content) || typeof content.text !== 'string') return;
-  const text = content.text.trim();
+  const text = messageText(message.message_type, content);
   if (
     !text ||
     text.length > 20_000 ||
@@ -176,13 +208,17 @@ function validCredentials(value: unknown): value is Credentials {
 }
 
 export class FeishuConnector {
-  private state: FeishuState = { status: 'disconnected', paired: false };
+  private state: FeishuState = { status: 'restoring', paired: false };
   private credentials?: Credentials;
   private transport?: FeishuTransport;
   private setupAbort?: AbortController;
   private setupReady?: Promise<FeishuState>;
   private cancelConnection?: () => void;
-  private ready: Promise<void>;
+  private restoring?: Promise<FeishuState>;
+  private restored = false;
+  private restoreError?: Error;
+  private restoreGeneration = 0;
+  private cancelRestore?: () => void;
   private generation = 0;
   private disposed = false;
   private pairingExpiresAt = 0;
@@ -197,23 +233,89 @@ export class FeishuConnector {
     private options: FeishuConnectorOptions,
     private dependencies: FeishuDependencies = sdkDependencies,
   ) {
-    this.ready = this.load().catch(() => {
-      this.update({
-        status: 'error',
-        error: '无法读取飞书本地加密配置，请检查系统钥匙串与存储目录。',
-      });
-      throw new Error('Feishu encrypted storage is unavailable');
-    });
-    // A renderer may read the initial state before invoking an async method.
-    void this.ready.catch(() => {});
+    if (options.deferRestore) this.update({ status: 'restoring' });
+    else void this.retryRestore().catch(() => {});
   }
 
   getState(): FeishuState {
     return { ...this.state };
   }
 
+  async retryRestore(): Promise<FeishuState> {
+    this.assertActive();
+    if (this.restored) return this.getState();
+    if (this.restoring) return this.restoring;
+    const generation = ++this.restoreGeneration;
+    let active = true;
+    const current = () => active && generation === this.restoreGeneration && !this.disposed;
+    const checkCurrent = () => {
+      if (!current()) throw new Error('Feishu restore attempt is no longer active');
+    };
+    this.restoreError = undefined;
+    this.update({ status: 'restoring', restoreFailed: false, error: undefined });
+    const requestedTimeout = this.options.restoreTimeoutMs ?? 15_000;
+    const timeoutMs =
+      Number.isFinite(requestedTimeout) && requestedTimeout > 0 ? requestedTimeout : 15_000;
+    const timeoutError = new Error('Feishu restore deadline exceeded');
+    let timer!: ReturnType<typeof setTimeout>;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(timeoutError), timeoutMs);
+      this.cancelRestore = () => {
+        active = false;
+        reject(new Error('Feishu restore cancelled'));
+      };
+    });
+    const task = Promise.race([this.load(checkCurrent), deadline])
+      .then((snapshot) => {
+        checkCurrent();
+        this.credentials = snapshot.credentials;
+        this.inbox = snapshot.inbox;
+        this.recoveryWarning = snapshot.recoveryWarning;
+        this.restored = true;
+        this.update({
+          status: 'disconnected',
+          hasSavedCredentials: Boolean(snapshot.credentials),
+          appId: snapshot.credentials?.appId,
+          paired: Boolean(snapshot.credentials?.binding),
+          error: snapshot.recoveryWarning,
+        });
+        return this.getState();
+      })
+      .catch((error) => {
+        active = false;
+        const message =
+          error === timeoutError
+            ? '恢复飞书本地加密数据超时。原有加密文件未更改，请先完成 macOS 钥匙串授权，再重试恢复。'
+            : '无法恢复飞书本地加密数据。原有加密文件未更改，请检查系统钥匙串授权与存储目录后重试。';
+        if (generation === this.restoreGeneration && !this.disposed) {
+          this.restoreError = new Error(message);
+          this.update({ status: 'error', restoreFailed: true, error: message });
+        }
+        throw new Error(message);
+      })
+      .finally(() => {
+        active = false;
+        clearTimeout(timer);
+        if (generation === this.restoreGeneration) {
+          this.restoring = undefined;
+          this.cancelRestore = undefined;
+        }
+      });
+    this.restoring = task;
+    return task;
+  }
+
+  private async ensureRestored(): Promise<void> {
+    this.assertActive();
+    if (this.restored) return;
+    if (this.restoring) await this.restoring;
+    else if (this.restoreError) throw this.restoreError;
+    else await this.retryRestore();
+    this.assertActive();
+  }
+
   async beginSetup(): Promise<FeishuState> {
-    await this.ready;
+    await this.ensureRestored();
     this.assertActive();
     if (this.setupReady && this.state.status === 'configuring') return this.setupReady;
     this.disconnect();
@@ -334,7 +436,7 @@ export class FeishuConnector {
   }
 
   async configure(input: { appId: string; appSecret: string }): Promise<FeishuState> {
-    await this.ready;
+    await this.ensureRestored();
     this.assertActive();
     const credentials = {
       appId: input?.appId?.trim(),
@@ -357,7 +459,7 @@ export class FeishuConnector {
   }
 
   async connect(): Promise<FeishuState> {
-    await this.ready;
+    await this.ensureRestored();
     this.assertActive();
     if (this.transport && (this.state.status === 'connected' || this.state.status === 'connecting'))
       return this.getState();
@@ -471,17 +573,17 @@ export class FeishuConnector {
     this.transport?.close();
     this.transport = undefined;
     this.update({
-      status: 'disconnected',
+      status: this.restored ? 'disconnected' : this.restoreError ? 'error' : 'restoring',
       paired: Boolean(this.credentials?.binding),
       setupUrl: undefined,
       setupQr: undefined,
-      error: undefined,
+      error: this.restored ? undefined : this.restoreError?.message,
     });
     return this.getState();
   }
 
   async sendReply(message: FeishuMessage, text: string): Promise<void> {
-    await this.ready;
+    await this.ensureRestored();
     this.assertActive();
     const credentials = this.credentials;
     const binding = credentials?.binding;
@@ -522,6 +624,7 @@ export class FeishuConnector {
   }
 
   async dispose(): Promise<void> {
+    this.cancelRestore?.();
     this.disconnect();
     this.disposed = true;
     await this.receiptQueue;
@@ -555,25 +658,43 @@ export class FeishuConnector {
     void task.finally(() => this.tasks.delete(task)).catch(() => {});
   }
 
-  private async load() {
-    await mkdir(path.join(this.options.storageDir, 'inbox'), { recursive: true, mode: 0o700 });
+  private async load(checkCurrent: () => void) {
+    let credentials: Credentials | undefined;
+    let credentialCiphertext: string | undefined;
     try {
-      const credentials: unknown = JSON.parse(
-        await this.options.decrypt(await readFile(this.configFile(), 'utf8')),
-      );
-      if (!validCredentials(credentials)) throw new Error('Invalid stored credentials');
-      this.credentials = credentials;
-      this.update({ appId: credentials.appId, paired: Boolean(credentials.binding) });
+      credentialCiphertext = await readFile(this.configFile(), 'utf8');
     } catch (error) {
       if (errorCode(error) !== 'ENOENT') throw error;
     }
-    for (const filename of await readdir(path.join(this.options.storageDir, 'inbox'))) {
+    checkCurrent();
+    this.update({ hasSavedCredentials: credentialCiphertext !== undefined });
+    if (credentialCiphertext !== undefined) {
+      const decrypted = await this.options.decrypt(credentialCiphertext);
+      checkCurrent();
+      const parsed: unknown = JSON.parse(decrypted);
+      if (!validCredentials(parsed)) throw new Error('Invalid stored credentials');
+      credentials = parsed;
+    }
+    let filenames: string[];
+    try {
+      filenames = await readdir(path.join(this.options.storageDir, 'inbox'));
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') throw error;
+      filenames = [];
+    }
+    checkCurrent();
+    const inbox = new Map<string, InboxItem>();
+    let recoveryWarning: string | undefined;
+    for (const filename of filenames) {
       if (!/^[a-f\d]{64}\.enc$/.test(filename)) continue;
-      const entry = JSON.parse(
-        await this.options.decrypt(
-          await readFile(path.join(this.options.storageDir, 'inbox', filename), 'utf8'),
-        ),
-      ) as InboxItem;
+      const ciphertext = await readFile(
+        path.join(this.options.storageDir, 'inbox', filename),
+        'utf8',
+      );
+      checkCurrent();
+      const decrypted = await this.options.decrypt(ciphertext);
+      checkCurrent();
+      const entry = JSON.parse(decrypted) as InboxItem;
       if (
         !entry?.appId ||
         !entry.message?.id ||
@@ -583,19 +704,20 @@ export class FeishuConnector {
       const key = this.itemKey(entry.appId, entry.message.id);
       if (`${key}.enc` !== filename) throw new Error('Invalid inbox key');
       if (entry.status === 'running') {
-        // A crashed process may have completed side effects. Never replay it automatically.
+        // Keep restore read-only: a crashed task stays failed in memory and is never replayed.
         entry.status = 'failed';
-        await this.saveItem(entry);
-        this.recoveryWarning =
+        recoveryWarning =
           '有上次中断的飞书任务，未自动重试。请先检查执行结果，再决定是否重新发送。';
-        this.update({ error: this.recoveryWarning });
       }
-      this.inbox.set(key, entry);
+      inbox.set(key, entry);
     }
+    checkCurrent();
+    return { credentials, inbox, recoveryWarning };
   }
 
   private async writeEncrypted(filename: string, value: unknown) {
     const encrypted = await this.options.encrypt(JSON.stringify(value));
+    await mkdir(path.dirname(filename), { recursive: true, mode: 0o700 });
     const temporary = `${filename}.${randomBytes(6).toString('hex')}.tmp`;
     const file = await open(temporary, 'wx', 0o600);
     try {
@@ -617,8 +739,9 @@ export class FeishuConnector {
       throw error;
     }
   }
-  private saveCredentials(credentials: Credentials) {
-    return this.writeEncrypted(this.configFile(), credentials);
+  private async saveCredentials(credentials: Credentials) {
+    await this.writeEncrypted(this.configFile(), credentials);
+    this.update({ hasSavedCredentials: true });
   }
   private saveItem(item: InboxItem) {
     return this.writeEncrypted(this.inboxFile(this.itemKey(item.appId, item.message.id)), item);

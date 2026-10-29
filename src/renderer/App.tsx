@@ -227,9 +227,13 @@ export default function App() {
       showToast('请在 Workbench 桌面应用中打开这个工作区', true);
       return;
     }
+    let disposed = false;
+    let browserUpdated = false;
+    let feishuUpdated = false;
     const handle = (event: AppEvent) => {
       if (event.type === 'browser:frame') lastFrame.current = event.frame;
       else if (event.type === 'browser:state') {
+        browserUpdated = true;
         setBrowser((previous) => {
           if (event.state.recording && !previous.recording) setLiveSteps([]);
           return event.state;
@@ -250,6 +254,7 @@ export default function App() {
           ...previous.filter((item) => item.id !== event.recording.id),
         ]);
       else if (event.type === 'feishu:state') {
+        feishuUpdated = true;
         setFeishu(event.state);
         if (event.state.status !== 'configuring') setConnecting(false);
       } else if (event.type === 'conversation:updated') upsert(event.conversation);
@@ -310,18 +315,22 @@ export default function App() {
     void window.workbench
       .invoke<AppSnapshot>('app:snapshot')
       .then((snapshot) => {
-        lastFrame.current = snapshot.browserFrame;
+        if (disposed) return;
+        lastFrame.current ??= snapshot.browserFrame;
         setSettings(snapshot.settings);
         setAgents(snapshot.agents);
-        setBrowser(snapshot.browser);
-        setFeishu(snapshot.feishu);
+        if (!browserUpdated) setBrowser(snapshot.browser);
+        if (!feishuUpdated) setFeishu(snapshot.feishu);
         setConversations(snapshot.conversations);
         setRecordings(snapshot.recordings);
         setConversationId(snapshot.conversations[0]?.id);
         setLoaded(true);
       })
       .catch((error) => showToast(errorText(error), true));
-    return unsubscribe;
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
   }, [showToast, upsert]);
   useEffect(() => {
     if (stickToBottom.current)
@@ -1054,10 +1063,31 @@ export default function App() {
                         ? '等待配对'
                         : feishu.status === 'connecting'
                           ? '连接中'
-                          : '未连接'}
+                          : feishu.status === 'restoring'
+                            ? '恢复中'
+                            : '未连接'}
                   </span>
                 </div>
-                {feishu.status === 'configuring' || feishu.setupQr ? (
+                {feishu.status === 'restoring' ? (
+                  <div className="feishu-paired">
+                    <Loader2 size={26} className="spin" />
+                    <h4>正在恢复飞书连接</h4>
+                    <p>如果 macOS 显示钥匙串授权提示，请核对应用名称后完成确认。</p>
+                  </div>
+                ) : feishu.status === 'error' && feishu.restoreFailed ? (
+                  <div className="feishu-paired">
+                    <ShieldCheck size={28} />
+                    <h4>暂时无法读取飞书配置</h4>
+                    <p>原有配置不会被覆盖。检查系统授权和存储目录后，可以重试恢复。</p>
+                    <button
+                      className="primary-button"
+                      onClick={() => void action('feishu:restore')}
+                    >
+                      <RefreshCw size={14} />
+                      重试恢复连接
+                    </button>
+                  </div>
+                ) : feishu.status === 'configuring' || feishu.setupQr ? (
                   <div className="feishu-setup">
                     {feishu.setupQr ? (
                       <img src={feishu.setupQr} alt="飞书新应用授权二维码" />
@@ -1130,21 +1160,27 @@ export default function App() {
                       <Command size={20} />
                     </div>
                     <p>
-                      创建一个属于这个工作区的机器人，
-                      <br />
-                      从飞书发起网页任务。
+                      {feishu.appId
+                        ? '连接已保存的机器人，继续从飞书发起任务。'
+                        : '创建一个属于这个工作区的机器人，从飞书发起网页任务。'}
                     </p>
                     <button
                       className="primary-button"
                       disabled={connecting || feishu.status === 'connecting'}
-                      onClick={() => void setupFeishu()}
+                      onClick={() => void (feishu.appId ? action('feishu:connect') : setupFeishu())}
                     >
-                      {connecting ? <Loader2 size={15} className="spin" /> : <Plus size={15} />}
-                      创建专用机器人
+                      {connecting ? (
+                        <Loader2 size={15} className="spin" />
+                      ) : feishu.appId ? (
+                        <Link2 size={15} />
+                      ) : (
+                        <Plus size={15} />
+                      )}
+                      {feishu.appId ? '连接已保存的机器人' : '创建专用机器人'}
                     </button>
                     {feishu.appId && (
-                      <button className="text-button" onClick={() => void action('feishu:connect')}>
-                        连接已保存的机器人
+                      <button className="text-button" onClick={() => void setupFeishu()}>
+                        新建另一个机器人
                       </button>
                     )}
                   </div>
@@ -1165,53 +1201,56 @@ export default function App() {
                     )}
                   </div>
                 )}
-                {feishu.status !== 'connected' && (
-                  <details className="manual-connection">
-                    <summary>
-                      使用已有应用凭据
-                      <ChevronDown size={14} />
-                    </summary>
-                    <form
-                      onSubmit={(event) => {
-                        event.preventDefault();
-                        void action<FeishuState>('feishu:configure', {
-                          appId: manualAppId.trim(),
-                          appSecret: manualSecret.trim(),
-                        }).then((result) => {
-                          if (result) {
-                            setFeishu(result);
-                            setManualSecret('');
-                            void action('feishu:connect');
-                          }
-                        });
-                      }}
-                    >
-                      <label>
-                        App ID
-                        <input
-                          value={manualAppId}
-                          onChange={(event) => setManualAppId(event.target.value)}
-                          autoComplete="off"
-                          placeholder="cli_…"
-                          required
-                        />
-                      </label>
-                      <label>
-                        App Secret
-                        <input
-                          type="password"
-                          value={manualSecret}
-                          onChange={(event) => setManualSecret(event.target.value)}
-                          autoComplete="new-password"
-                          required
-                        />
-                      </label>
-                      <button className="secondary-button" type="submit">
-                        保存并连接
-                      </button>
-                    </form>
-                  </details>
-                )}
+                {feishu.status !== 'connected' &&
+                  feishu.status !== 'restoring' &&
+                  !feishu.restoreFailed &&
+                  !feishu.hasSavedCredentials && (
+                    <details className="manual-connection">
+                      <summary>
+                        使用已有应用凭据
+                        <ChevronDown size={14} />
+                      </summary>
+                      <form
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          void action<FeishuState>('feishu:configure', {
+                            appId: manualAppId.trim(),
+                            appSecret: manualSecret.trim(),
+                          }).then((result) => {
+                            if (result) {
+                              setFeishu(result);
+                              setManualSecret('');
+                              void action('feishu:connect');
+                            }
+                          });
+                        }}
+                      >
+                        <label>
+                          App ID
+                          <input
+                            value={manualAppId}
+                            onChange={(event) => setManualAppId(event.target.value)}
+                            autoComplete="off"
+                            placeholder="cli_…"
+                            required
+                          />
+                        </label>
+                        <label>
+                          App Secret
+                          <input
+                            type="password"
+                            value={manualSecret}
+                            onChange={(event) => setManualSecret(event.target.value)}
+                            autoComplete="new-password"
+                            required
+                          />
+                        </label>
+                        <button className="secondary-button" type="submit">
+                          保存并连接
+                        </button>
+                      </form>
+                    </details>
+                  )}
               </>
             )}
           </div>

@@ -486,10 +486,12 @@ export class BrowserRuntime {
 
   private async bridge<T = any>(expression: string): Promise<T> {
     this.requireReady();
-    await this.until(async () => this.contextId !== undefined || undefined);
+    // BFCache can announce a restored context before frameNavigated clears the cache.
+    // Resolve the named world from the active frame instead of waiting for another event.
+    const contextId = await this.prepareBridgeContext();
     const result = await this.page!.call('Runtime.evaluate', {
       expression,
-      contextId: this.contextId,
+      contextId,
       returnByValue: true,
       awaitPromise: true,
     });
@@ -498,6 +500,61 @@ export class BrowserRuntime {
         result.exceptionDetails.exception?.description || result.exceptionDetails.text,
       );
     return result.result.value as T;
+  }
+
+  private async prepareBridgeContext(): Promise<number> {
+    const page = this.page!;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      this.requireReady();
+      try {
+        const tree = await page.call('Page.getFrameTree');
+        const frameId = tree.frameTree.frame.id;
+        const world = await page.call('Page.createIsolatedWorld', {
+          frameId,
+          worldName: WORLD,
+        });
+        const contextId = world.executionContextId as number;
+        const ready = await page.call('Runtime.evaluate', {
+          expression:
+            'typeof globalThis.__workbenchPage === "object" && typeof globalThis.__workbenchEvent === "function"',
+          contextId,
+          returnByValue: true,
+        });
+        if (ready.exceptionDetails)
+          throw new Error(
+            ready.exceptionDetails.exception?.description || ready.exceptionDetails.text,
+          );
+        if (!ready.result.value) {
+          await page.call('Runtime.addBinding', {
+            name: '__workbenchEvent',
+            executionContextId: contextId,
+          });
+          const installed = await page.call('Runtime.evaluate', {
+            expression: browserPageSource,
+            contextId,
+          });
+          if (installed.exceptionDetails)
+            throw new Error(
+              installed.exceptionDetails.exception?.description || installed.exceptionDetails.text,
+            );
+        }
+        this.mainFrameId = frameId;
+        this.contextId = contextId;
+        return contextId;
+      } catch (error) {
+        this.contextId = undefined;
+        const message = error instanceof Error ? error.message : String(error);
+        if (
+          attempt === 2 ||
+          !/Cannot find (?:context|execution context)|Execution context was destroyed|No frame with given id|No frame for given id/i.test(
+            message,
+          )
+        )
+          throw error;
+        await wait(30);
+      }
+    }
+    throw new Error('无法连接当前页面的隔离上下文');
   }
 
   private requireReady(): void {

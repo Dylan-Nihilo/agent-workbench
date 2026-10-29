@@ -428,6 +428,11 @@ async function invoke(action: string, payload: unknown) {
     case 'feishu:connect':
       await feishu.connect();
       return feishu.getState();
+    case 'feishu:restore': {
+      const restored = await feishu.retryRestore();
+      if (restored.appId) return feishu.connect();
+      return restored;
+    }
     case 'feishu:disconnect':
       await feishu.disconnect();
       return feishu.getState();
@@ -475,6 +480,7 @@ async function launch() {
   await createBrowserRuntime(store.data.settings.browserPath);
   feishu = new FeishuConnector({
     storageDir: path.join(app.getPath('userData'), 'feishu'),
+    deferRestore: true,
     encrypt: async (value) => {
       if (!(await safeStorage.isAsyncEncryptionAvailable()))
         throw new Error('系统密钥存储不可用，无法保存飞书连接');
@@ -513,10 +519,19 @@ async function launch() {
       throw new Error('请求来源无效');
     return invoke(string(action, 100), payload);
   });
+  let restorationStarted = false;
+  const restoreConnections = () => {
+    if (restorationStarted) return;
+    restorationStarted = true;
+    void feishu.retryRestore().catch(() => {});
+  };
+  // A visible, focused host gives macOS a place to present any Keychain authorization.
+  window.once('focus', restoreConnections);
   if (process.env.WORKBENCH_DEV_SERVER_URL)
     await window.loadURL(process.env.WORKBENCH_DEV_SERVER_URL);
   else await window.loadFile(path.join(__dirname, '../renderer/index.html'));
   window.show();
+  if (window.isFocused()) restoreConnections();
   void browser
     .start()
     .then(() => browser.navigate(demoUrl))
