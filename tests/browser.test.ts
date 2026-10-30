@@ -1191,3 +1191,621 @@ test(
     }
   },
 );
+
+test(
+  'real BrowserOS neo: hover, selection, iframe cleanup and drag input use native targets',
+  { skip: !binary, timeout: 30_000 },
+  async () => {
+    const storageDir = await mkdtemp(join(tmpdir(), 'workbench-hover-test-'));
+    const fixture = createServer((request, response) => {
+      response.setHeader('Content-Type', 'text/html; charset=utf-8');
+      const port = (fixture.address() as { port: number }).port;
+      response.end(
+        request.url?.startsWith('/child')
+          ? '<!doctype html><style>body{padding:20px}button{padding:16px}</style><button id="child">Frame target</button>'
+          : `<!doctype html><title>Selection preview</title><style>body{font:18px system-ui;margin:40px;min-height:1600px}button{padding:14px 28px}iframe{display:block;margin-top:40px;width:400px;height:160px}#drag{width:max-content;margin-top:26px}</style><button id="target">Preview this button</button><p id="drag">Native drag selection stays available.</p><iframe src="http://localhost:${port}/child"></iframe><article id="below" style="height:240px">Below the fold</article><script>window.clicks=0;window.moves=[];target.onclick=()=>window.clicks++;document.addEventListener('mousemove',event=>window.moves.push({x:event.clientX,buttons:event.buttons}));window.dragOrder=[];for(const type of ['mousedown','mousemove','mouseup'])document.addEventListener(type,event=>window.dragOrder.push(type));</script>`,
+      );
+    });
+    await new Promise<void>((resolve) => fixture.listen(0, '127.0.0.1', resolve));
+    let takeovers = 0;
+    const runtime = new BrowserRuntime({
+      storageDir,
+      binaryPath: binary,
+      onState() {},
+      onFrame() {},
+      onStep() {},
+      onSelected() {},
+      onHumanTakeover() {
+        takeovers++;
+      },
+    });
+    const until = async (read: () => Promise<any>, valid: (result: any) => boolean) => {
+      const end = Date.now() + 4000;
+      while (Date.now() < end) {
+        const result = await read();
+        if (valid(result)) return result;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      throw new Error('Selection condition did not become true');
+    };
+    try {
+      await runtime.start(`http://127.0.0.1:${(fixture.address() as { port: number }).port}/`);
+      const tab = (runtime as any).tabs.get(runtime.getState().activeTabId);
+      const evaluate = async (expression: string) =>
+        (await tab.page.call('Runtime.evaluate', { expression, returnByValue: true })).result.value;
+      const target = (await runtime.queryElements({ selector: '#target' })).elements[0];
+      const child = await until(
+        () => runtime.queryElements({ selector: '#child' }),
+        (value) => value.elements.length === 1,
+      ).then((result) => result.elements[0]);
+      await runtime.setInspect(true);
+      const read = async (element: ElementRef, kind: string) => {
+        const frame = tab.frames.get(element.frameId);
+        return (runtime as any).bridge(
+          tab,
+          frame,
+          `(()=>{const box=globalThis.__testOverlayRoot?.querySelector('[data-kind="${kind}"]');if(!box)return null;const rect=box.getBoundingClientRect();return {visible:getComputedStyle(box).display!=='none',x:rect.x,y:rect.y,width:rect.width,height:rect.height,label:box.querySelector('span')?.textContent,phase:box.className};})()`,
+        );
+      };
+      for (const frame of tab.frames.values())
+        await (runtime as any).bridge(
+          tab,
+          frame,
+          `(()=>{const original=Element.prototype.attachShadow;Element.prototype.attachShadow=function(init){const root=original.call(this,init);if(this.hasAttribute('data-workbench-overlay'))globalThis.__testOverlayRoot=root;return root;};})()`,
+        );
+      const point = (element: ElementRef) => ({
+        x: element.bounds!.x + element.bounds!.width / 2,
+        y: element.bounds!.y + element.bounds!.height / 2,
+      });
+      await runtime.dispatchInput({ type: 'mouse', action: 'move', ...point(target), buttons: 0 });
+      const hover = await until(
+        () => read(target, 'hover'),
+        (value) => value?.visible,
+      );
+      assert(Math.abs(hover.x - target.bounds!.x) < 1);
+      assert.equal(takeovers, 0, 'Hover must never take control from Agent');
+      assert.equal(await evaluate('clicks'), 0);
+      const nativeHover = await evaluate('document.querySelector("#target").matches(":hover")');
+      assert.equal(nativeHover, true, 'Forwarded hover must still reach the website');
+      await runtime.dispatchInput({ type: 'mouse', action: 'move', ...point(child), buttons: 0 });
+      await until(
+        () => read(child, 'hover'),
+        (value) => value?.visible,
+      );
+      await until(
+        () => read(target, 'hover'),
+        (value) => !value?.visible,
+      );
+      await runtime.dispatchInput({ type: 'mouse', action: 'leave', x: 0, y: 0 });
+      await until(
+        () => read(child, 'hover'),
+        (value) => !value?.visible,
+      );
+      await runtime.dispatchInput({ type: 'mouse', action: 'move', ...point(target), buttons: 0 });
+      await runtime.dispatchInput({
+        type: 'mouse',
+        action: 'down',
+        ...point(target),
+        button: 'left',
+        buttons: 1,
+      });
+      await runtime.dispatchInput({
+        type: 'mouse',
+        action: 'up',
+        ...point(target),
+        button: 'left',
+        buttons: 0,
+      });
+      assert.equal(runtime.getState().selectedElement?.nodeId, target.nodeId);
+      assert.equal(runtime.getState().inspecting, false);
+      assert.equal(await evaluate('clicks'), 0, 'Selecting must not activate a website button');
+      assert.equal(await evaluate('scrollY'), 0, 'Pointer selection must not recenter the page');
+      await until(
+        () => read(target, 'selected'),
+        (value) => value?.visible,
+      );
+      await runtime.setElementFeedback(target.ref, 'working');
+      await until(
+        () => read(target, 'feedback'),
+        (value) => value?.visible,
+      );
+      runtime.allowAgentControl();
+      assert(
+        !(
+          await runtime.callTool('workbench_browser_edit', {
+            ref: target.ref,
+            styles: { 'border-radius': '18px' },
+          })
+        ).isError,
+      );
+      await runtime.setElementFeedback(target.ref, null);
+      assert.equal(
+        (await read(target, 'feedback')).phase,
+        'box feedback applied',
+        'Turn completion must not cut off success feedback',
+      );
+      await until(
+        () => read(target, 'feedback'),
+        (value) => !value?.visible,
+      );
+      await runtime.setInspect(true);
+      await runtime.dispatchInput({ type: 'mouse', action: 'move', ...point(target), buttons: 0 });
+      const below = (await runtime.queryElements({ selector: '#below' })).elements[0];
+      await runtime.dispatchInput({
+        type: 'wheel',
+        ...point(target),
+        deltaX: 0,
+        deltaY: Math.round(below.bounds!.y - target.bounds!.y),
+      });
+      await until(
+        () => read(target, 'hover'),
+        (value) => value?.visible && value.label.startsWith('article'),
+      );
+      await evaluate('scrollTo(0,0)');
+      await runtime.dispatchInput({
+        type: 'key',
+        action: 'down',
+        key: 'Escape',
+        code: 'Escape',
+        keyCode: 27,
+      });
+      assert.equal(runtime.getState().inspecting, false);
+      const drag = (await runtime.queryElements({ selector: '#drag' })).elements[0].bounds!;
+      await evaluate('dragOrder=[]');
+      (runtime as any).queue = new Promise((resolve) => setTimeout(resolve, 100));
+      const down = runtime.dispatchInput({
+        type: 'mouse',
+        action: 'down',
+        x: drag.x + 2,
+        y: drag.y + drag.height / 2,
+        button: 'left',
+        buttons: 1,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 16));
+      const move = runtime.dispatchInput({
+        type: 'mouse',
+        action: 'move',
+        x: drag.x + drag.width - 2,
+        y: drag.y + drag.height / 2,
+        button: 'left',
+        buttons: 1,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 16));
+      const up = runtime.dispatchInput({
+        type: 'mouse',
+        action: 'up',
+        x: drag.x + drag.width - 2,
+        y: drag.y + drag.height / 2,
+        button: 'left',
+        buttons: 0,
+      });
+      await Promise.all([down, move, up]);
+      assert.deepEqual(await evaluate('dragOrder'), ['mousedown', 'mousemove', 'mouseup']);
+      assert(
+        (await evaluate('String(getSelection())')).length > 10,
+        'Mouse move coalescing must preserve drag selection',
+      );
+      const moves = await evaluate('moves');
+      assert(moves.some((move: { buttons: number }) => move.buttons === 1));
+      await runtime.selectElement(child.ref);
+      await runtime.setInspect(true);
+      await evaluate('document.querySelector("iframe").src += "?next"');
+      await until(
+        () => Promise.resolve(runtime.getState()),
+        (value) => !value.selectedElement,
+      );
+      assert.equal(
+        runtime.getState().inspecting,
+        true,
+        'Child navigation must keep UI and local inspection flags consistent',
+      );
+      await runtime.dispatchInput({ type: 'mouse', action: 'move', ...point(target), buttons: 0 });
+      await until(
+        () => read(target, 'hover'),
+        (value) => value?.visible,
+      );
+      const previousTab = runtime.getState().activeTabId!;
+      const second = await runtime.newTab();
+      await runtime.switchTab(previousTab);
+      assert.equal(runtime.getState().inspecting, false);
+      assert.equal(
+        await evaluate('document.querySelectorAll("[data-workbench-overlay]").length'),
+        0,
+      );
+      await runtime.closeTab(second.id);
+    } finally {
+      await runtime.dispose();
+      await new Promise<void>((resolve) => fixture.close(() => resolve()));
+      await rm(storageDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  },
+);
+
+test('hover forwarding keeps only the latest point without waiting for an Agent action', async () => {
+  const runtime = new BrowserRuntime({
+    storageDir: '/unused-hover-test',
+    onState() {},
+    onFrame() {},
+    onStep() {},
+    onSelected() {},
+    onHumanTakeover() {
+      assert.fail('Hover cannot take over');
+    },
+  }) as any;
+  const calls: number[] = [];
+  let release!: () => void;
+  runtime.state.status = 'ready';
+  runtime.activeTabId = 'tab';
+  runtime.tabs.set('tab', {
+    info: { id: 'tab' },
+    page: {
+      call: async (name: string, args: any) => {
+        assert.equal(name, 'Input.dispatchMouseEvent');
+        calls.push(args.x);
+        if (calls.length === 1)
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+      },
+    },
+  });
+  runtime.queue = new Promise(() => {});
+  const promises = Array.from({ length: 80 }, (_, x) =>
+    runtime.dispatchInput({ type: 'mouse', action: 'move', x, y: 20, buttons: 0 }),
+  );
+  assert.deepEqual(calls, [0]);
+  release();
+  await Promise.all(promises);
+  assert.deepEqual(
+    calls,
+    [0, 79],
+    'A burst must forward the initial and latest point, never a backlog',
+  );
+});
+
+test('leaving a stalled hover cannot block page actions or clear a newer hover', async () => {
+  for (const next of ['reenter', 'switch-tab']) {
+    const runtime = new BrowserRuntime({
+      storageDir: '/unused-hover-test',
+      onState() {},
+      onFrame() {},
+      onStep() {},
+      onSelected() {},
+      onHumanTakeover() {},
+    }) as any;
+    let release!: () => void;
+    let moveCount = 0,
+      clearCount = 0;
+    const page = {
+      call: async (name: string) => {
+        if (name === 'Input.dispatchMouseEvent' && ++moveCount === 1)
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+        if (name === 'Runtime.evaluate') clearCount++;
+        return {};
+      },
+    };
+    const tab = {
+      info: { id: 'tab' },
+      activation: 1,
+      diagnostics: [],
+      frames: new Map([['frame', { id: 'frame', contextId: 1, channel: page }]]),
+      page,
+    };
+    runtime.state.status = 'ready';
+    runtime.activeTabId = 'tab';
+    runtime.tabs.set('tab', tab);
+    runtime.refs.set('selected', { tabId: 'tab' });
+    const started: string[] = [];
+    runtime.queryInternal = async () => {
+      started.push('query');
+      return {};
+    };
+    runtime.selectElementInternal = async () => {
+      started.push('select');
+      return {};
+    };
+    const pending = runtime.dispatchInput({
+      type: 'mouse',
+      action: 'move',
+      x: 10,
+      y: 10,
+      buttons: 0,
+    });
+    const leave = runtime.dispatchInput({ type: 'mouse', action: 'leave', x: 0, y: 0 });
+    const query = runtime.queryElements({}),
+      select = runtime.selectElement('selected');
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.deepEqual(
+        started,
+        ['query', 'select'],
+        'An unresolved hover acknowledgement must not hold the action queue',
+      );
+      await Promise.all([leave, query, select]);
+      assert.equal(clearCount, 1);
+      if (next === 'reenter')
+        void runtime.dispatchInput({ type: 'mouse', action: 'move', x: 30, y: 30, buttons: 0 });
+      else tab.activation += 2;
+      release();
+      await pending;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.equal(clearCount, 1, `Late hover cleanup must not affect ${next}`);
+    } finally {
+      release();
+      await pending;
+    }
+  }
+});
+
+test('prepared frames reuse their world while checking document identity once per call', async () => {
+  const runtime = new BrowserRuntime({
+    storageDir: '/unused-context-test',
+    onState() {},
+    onFrame() {},
+    onStep() {},
+    onSelected() {},
+    onHumanTakeover() {},
+  }) as any;
+  const calls: string[] = [];
+  const frame = {
+    id: 'frame',
+    contextId: 7,
+    documentId: 'document',
+    revision: 1,
+    channel: {
+      call: async (method: string) => {
+        calls.push(method);
+        assert.equal(method, 'Runtime.evaluate');
+        return { result: { value: { ready: true, documentId: 'document' } } };
+      },
+    },
+  };
+  const tab = { info: { id: 'tab' }, frames: new Map([['frame', frame]]), edits: [] };
+  runtime.tabs.set('tab', tab);
+  assert.equal((await runtime.prepareFrame(tab, frame)).contextId, 7);
+  assert.equal((await runtime.prepareFrame(tab, frame)).contextId, 7);
+  assert.deepEqual(calls, ['Runtime.evaluate', 'Runtime.evaluate']);
+});
+
+test('a destroyed cached context is recreated and a changed document invalidates old references', async () => {
+  const runtime = new BrowserRuntime({
+    storageDir: '/unused-context-test',
+    onState() {},
+    onFrame() {},
+    onStep() {},
+    onSelected() {},
+    onHumanTakeover() {},
+  }) as any;
+  const calls: Array<{ method: string; contextId?: number }> = [];
+  const frame = {
+    id: 'frame',
+    contextId: 7 as number | undefined,
+    documentId: 'old-document',
+    revision: 1,
+    channel: {
+      call: async (method: string, params: any) => {
+        calls.push({ method, contextId: params.contextId });
+        if (method === 'Page.createIsolatedWorld') return { executionContextId: 9 };
+        if (params.contextId === 7) throw new Error('Cannot find context with specified id');
+        if (params.expression.includes('ready:'))
+          return { result: { value: { ready: true, documentId: 'new-document' } } };
+        return { result: { value: undefined } };
+      },
+    },
+  };
+  const tab = {
+    info: { id: 'tab' },
+    frames: new Map([['frame', frame]]),
+    edits: [{ frameId: 'frame' }],
+  };
+  runtime.tabs.set('tab', tab);
+  runtime.refs.set('old-ref', { tabId: 'tab', frameId: 'frame' });
+  assert.equal((await runtime.prepareFrame(tab, frame)).contextId, 9);
+  assert.equal(frame.documentId, 'new-document');
+  assert.equal(frame.revision, 2);
+  assert.equal(runtime.refs.has('old-ref'), false);
+  assert.equal(tab.edits.length, 0);
+  assert.deepEqual(
+    calls.map((value) => value.method),
+    ['Runtime.evaluate', 'Page.createIsolatedWorld', 'Runtime.evaluate', 'Runtime.evaluate'],
+  );
+});
+
+test('frame channel migration discards cached IDs and ignores late events from the prior owner', async () => {
+  const runtime = new BrowserRuntime({
+    storageDir: '/unused-owner-test',
+    onState() {},
+    onFrame() {},
+    onStep() {},
+    onSelected() {},
+    onHumanTakeover() {},
+  }) as any;
+  const handlers = new Map<string, (value: any) => void>();
+  const oldChannel = {
+    on: (name: string, fn: (value: any) => void) => handlers.set(name, fn),
+    call: async (name: string) => {
+      if (name === 'Page.getFrameTree')
+        return { frameTree: { frame: { id: 'frame', url: 'https://example.test' } } };
+      return { result: { value: { ready: true, documentId: 'old-document' } } };
+    },
+  };
+  const calls: Array<{ name: string; contextId?: number }> = [];
+  const newChannel = {
+    on() {},
+    call: async (name: string, params: any = {}) => {
+      calls.push({ name, contextId: params.contextId });
+      if (name === 'Page.createIsolatedWorld') return { executionContextId: 99 };
+      return {
+        result: {
+          value: {
+            ready: true,
+            documentId: params.contextId === 7 ? 'foreign-document' : 'new-document',
+          },
+        },
+      };
+    },
+  };
+  const frame = {
+    id: 'frame',
+    url: 'https://example.test',
+    channel: oldChannel,
+    contextId: 7,
+    documentId: 'old-document',
+    revision: 1,
+    source: 'human',
+  };
+  const tab = {
+    info: { id: 'tab' },
+    page: oldChannel,
+    frames: new Map([['frame', frame]]),
+    channels: new Set(),
+    children: new Set(),
+    edits: [{ frameId: 'frame' }],
+  };
+  runtime.tabs.set('tab', tab);
+  runtime.refs.set('old-ref', { tabId: 'tab', frameId: 'frame' });
+  await runtime.installChannel(tab, oldChannel);
+  runtime.registerFrame(tab, { id: 'frame', url: 'https://other.test' }, newChannel);
+  assert.equal(frame.contextId, undefined);
+  assert.equal(frame.documentId, undefined);
+  assert.equal(runtime.refs.has('old-ref'), false);
+  assert.equal(tab.edits.length, 0);
+  const prepared = await runtime.prepareFrame(tab, frame);
+  assert.equal(prepared.channel, newChannel);
+  assert.equal(prepared.contextId, 99);
+  assert.equal(frame.documentId, 'new-document');
+  assert.equal(
+    calls.some((value) => value.contextId === 7),
+    false,
+    'A channel-local ID must never be sent to the new owner',
+  );
+  handlers.get('Runtime.executionContextCreated')!({
+    context: { id: 99, name: 'workbench-browser-observer', auxData: { frameId: 'frame' } },
+  });
+  assert.equal(frame.contextId, 99);
+  handlers.get('Runtime.executionContextDestroyed')!({ executionContextId: 99 });
+  assert.equal(
+    frame.contextId,
+    99,
+    'An old channel must not invalidate the new owner’s same numeric ID',
+  );
+  handlers.get('Runtime.executionContextCreated')!({
+    context: { id: 77, name: 'workbench-browser-observer', auxData: { frameId: 'frame' } },
+  });
+  assert.equal(frame.contextId, 99, 'Late old-world creation cannot replace the cache');
+  let recorded = 0;
+  runtime.recordEvent = () => {
+    recorded++;
+  };
+  handlers.get('Runtime.bindingCalled')!({
+    name: '__workbenchEvent',
+    executionContextId: 77,
+    payload: JSON.stringify({ kind: 'click', docId: 'new-document' }),
+  });
+  assert.equal(recorded, 0);
+  handlers.get('Runtime.executionContextsCleared')!({});
+  assert.equal(frame.contextId, 99);
+});
+
+test('an in-flight world validation cannot overwrite a frame that changed channel', async () => {
+  const runtime = new BrowserRuntime({
+    storageDir: '/unused-owner-test',
+    onState() {},
+    onFrame() {},
+    onStep() {},
+    onSelected() {},
+    onHumanTakeover() {},
+  }) as any;
+  let release!: (value: any) => void;
+  const oldChannel = {
+    call: async () =>
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    on() {},
+  };
+  const newCalls: Array<{ name: string; contextId?: number }> = [];
+  const newChannel = {
+    call: async (name: string, params: any) => {
+      newCalls.push({ name, contextId: params.contextId });
+      return { result: { value: { ready: true, documentId: 'new-document' } } };
+    },
+    on() {},
+  };
+  const frame = {
+    id: 'frame',
+    channel: oldChannel,
+    contextId: 7 as number | undefined,
+    documentId: 'old-document' as string | undefined,
+    revision: 1,
+  };
+  const tab = {
+    info: { id: 'tab' },
+    page: oldChannel,
+    frames: new Map([['frame', frame]]),
+    children: new Set(),
+    edits: [],
+  };
+  runtime.tabs.set('tab', tab);
+  const pending = runtime.prepareFrame(tab, frame);
+  runtime.registerFrame(tab, { id: 'frame' }, newChannel);
+  frame.contextId = 99;
+  release({ result: { value: { ready: true, documentId: 'old-document' } } });
+  const prepared = await pending;
+  assert.equal(prepared.channel, newChannel);
+  assert.equal(prepared.contextId, 99);
+  assert.equal(frame.contextId, 99);
+  assert.equal(frame.documentId, 'new-document');
+  assert(newCalls.every((value) => value.contextId === 99));
+});
+
+test('bridge rejects migration after preparation without sending or replaying an action', async () => {
+  const runtime = new BrowserRuntime({
+    storageDir: '/unused-owner-test',
+    onState() {},
+    onFrame() {},
+    onStep() {},
+    onSelected() {},
+    onHumanTakeover() {},
+  }) as any;
+  let actions = 0;
+  const oldChannel = {
+      call: async () => {
+        actions++;
+        return {};
+      },
+      on() {},
+    },
+    newChannel = { ...oldChannel };
+  const frame = {
+    id: 'frame',
+    channel: oldChannel,
+    contextId: 7,
+    documentId: 'old-document',
+    revision: 1,
+  };
+  const tab = {
+    info: { id: 'tab' },
+    page: oldChannel,
+    frames: new Map([['frame', frame]]),
+    children: new Set(),
+    edits: [],
+  };
+  runtime.tabs.set('tab', tab);
+  runtime.prepareFrame = async () => {
+    const prepared = { channel: oldChannel, contextId: 7, revision: 1 };
+    runtime.registerFrame(tab, { id: 'frame' }, newChannel);
+    return prepared;
+  };
+  await assert.rejects(
+    runtime.bridge(
+      tab,
+      frame,
+      'globalThis.__workbenchPage.edit({ref:"old-ref",text:"must not apply"})',
+    ),
+    /页面框架已改变/,
+  );
+  assert.equal(actions, 0);
+});

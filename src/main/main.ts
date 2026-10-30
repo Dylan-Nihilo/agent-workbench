@@ -20,6 +20,7 @@ import type {
   ElementAnimation,
   ElementEdit,
   ElementQuery,
+  ElementRef,
   FeishuMessage,
   PendingAgentRequest,
   Recording,
@@ -140,6 +141,7 @@ async function runTurn(
   context?: string,
   source: 'desktop' | 'feishu' = 'desktop',
   readonly = false,
+  selectedElement?: ElementRef,
 ) {
   if (active || startingTurn) throw new Error('当前任务还在进行，请先停止或等待完成');
   if (conversation.workspace && conversation.workspace !== store.data.settings.workspace)
@@ -198,6 +200,7 @@ async function runTurn(
       sessionToolsFingerprint: conversation.agentToolsFingerprint,
       historyForToolUpgrade: visibleHistory,
       tools: browser.getTools(),
+      inspectSelectedElement: (ref) => browser.getElementDetails(ref),
       callTool: async (name: string, args: unknown) => {
         if (!active || active.conversationId !== conversation.id)
           return { text: '任务已经停止，不能再执行浏览器操作。', isError: true };
@@ -228,8 +231,10 @@ async function runTurn(
     requests: [],
   };
   if (!readonly) browser.allowAgentControl();
+  if (selectedElement && !readonly)
+    void browser.setElementFeedback(selectedElement.ref, 'working').catch(() => {});
   try {
-    await session.send(text, context);
+    await session.send(text, context, selectedElement);
     if (assistant.status === 'streaming') assistant.status = 'done';
     if (session.sessionId) conversation.agentSessionId = session.sessionId;
     return notifications.includesSecretInput
@@ -247,6 +252,8 @@ async function runTurn(
       : error;
   } finally {
     browser.revokeAgentControl();
+    if (selectedElement && !readonly)
+      await browser.setElementFeedback(selectedElement.ref, null).catch(() => {});
     if (session.sessionId) conversation.agentSessionId = session.sessionId;
     conversation.agentToolsFingerprint = session.toolsFingerprint;
     if (session.replacedSessionId) {
@@ -273,9 +280,15 @@ async function stopTurn() {
   browser.revokeAgentControl();
   await active.session.interrupt();
 }
-function startTurn(conversation: Conversation, text: string, context?: string, readonly = false) {
+function startTurn(
+  conversation: Conversation,
+  text: string,
+  context?: string,
+  readonly = false,
+  selectedElement?: ElementRef,
+) {
   if (active || startingTurn) throw new Error('当前任务还在进行，请先停止');
-  void runTurn(conversation, text, context, 'desktop', readonly).catch((error) =>
+  void runTurn(conversation, text, context, 'desktop', readonly, selectedElement).catch((error) =>
     notice(error instanceof Error ? error.message : '任务失败', 'error'),
   );
   return { conversationId: conversation.id };
@@ -366,9 +379,14 @@ async function invoke(action: string, payload: unknown) {
       return createConversation();
     case 'conversation:send': {
       const data = record(payload);
-      const conversation = data.id ? getConversation(data.id) : createConversation();
       const context = data.context === undefined ? undefined : string(data.context, 60_000);
-      return startTurn(conversation, string(data.text), context);
+      const selectedRef =
+        data.selectedRef === undefined ? undefined : string(data.selectedRef, 1500);
+      const selected = selectedRef ? browser.getState().selectedElement : undefined;
+      if (selectedRef && selected?.ref !== selectedRef)
+        throw new Error('选中的元素已变化，请重新选取后发送。');
+      const conversation = data.id ? getConversation(data.id) : createConversation();
+      return startTurn(conversation, string(data.text), context, false, selected);
     }
     case 'conversation:stop':
       await stopTurn();

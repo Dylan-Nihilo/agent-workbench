@@ -1,4 +1,5 @@
 /** Manual live check: ./node_modules/.bin/tsx tests/live-motion.e2e.ts
+ * Add --without-selection-prefetch to measure the extra model-driven inspection roundtrip.
  * Uses one real Codex turn and an isolated BrowserOS profile. Never runs in npm test.
  */
 import assert from 'node:assert/strict';
@@ -64,6 +65,9 @@ const calls: Array<{
   success: boolean;
   text: string;
 }> = [];
+const prefetchSelection = !process.argv.includes('--without-selection-prefetch');
+const timings: Record<string, number> = {};
+let sendStartedAt = 0;
 const prohibited: string[] = [];
 let runtime: BrowserRuntime | undefined;
 let agent: CodexSession | undefined;
@@ -229,7 +233,15 @@ try {
     workspace,
     executablePath: codex.path,
     tools,
+    inspectSelectedElement: async (ref) => {
+      const started = performance.now();
+      const detail = await runtime!.getElementDetails(ref);
+      timings.hostInspectionMs = Math.round(performance.now() - started);
+      return detail;
+    },
     callTool: async (name, args) => {
+      timings.firstToolMs ??= Date.now() - sendStartedAt;
+      if (name === 'workbench_browser_edit') timings.firstEditMs ??= Date.now() - sendStartedAt;
       assert.ok(allowed.has(name));
       assert.equal(
         new URL(runtime!.getState().url).origin,
@@ -277,14 +289,25 @@ try {
   });
   agentBusy = true;
   timeout = setTimeout(() => agent?.close(), 150000);
+  sendStartedAt = Date.now();
   await agent.send(
-    '把这个按钮改成红色渐变，加呼吸弹跳动画。请直接在当前本地测试页面预览，动画保持循环运行，颜色和节奏自行选择，不需要追问。只改附带选中上下文所指的按钮，不点击、不导航、不提交表单、不改源码，不运行本机命令或文件操作。保留网站本来已有的动画。请使用当前浏览器工具实际完成，并通过 inspect 或 screenshot 核对结果；先不要撤销，测试宿主会在完成后独立验收并撤销。',
+    '把这个按钮改成红色渐变，加呼吸弹跳动画。请直接在当前本地测试页面预览，动画保持循环运行，颜色和节奏自行选择，不需要追问。只改附带选中上下文所指的按钮，不点击、不导航、不提交表单、不改源码，不运行本机命令或文件操作。保留网站本来已有的动画。请使用当前浏览器工具实际完成，并通过工具返回的更新后元素详情或必要的截图核对结果；先不要撤销，测试宿主会在完成后独立验收并撤销。',
     JSON.stringify({
-      selectedElement: selected,
+      selectedElement: {
+        ref: selected.ref,
+        tabId: selected.tabId,
+        frameId: selected.frameId,
+        documentId: selected.documentId,
+        nodeId: selected.nodeId,
+        tag: selected.tag,
+        name: selected.name,
+      },
       pageUrl: `${origin}/`,
       purpose: 'isolated browser preview integration test',
     }),
+    prefetchSelection ? selected : undefined,
   );
+  timings.turnMs = Date.now() - sendStartedAt;
   agentBusy = false;
   clearTimeout(timeout);
   assert.deepEqual(prohibited, []);
@@ -383,6 +406,8 @@ try {
   Object.assign(report, {
     passed: true,
     modelTurns: 1,
+    prefetchSelection,
+    timings,
     frameCount,
     after,
     later,

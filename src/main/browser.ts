@@ -347,6 +347,11 @@ interface FrameGeometry {
   scaleX: number;
   scaleY: number;
 }
+interface PreparedContext {
+  channel: BrowserChannel;
+  contextId: number;
+  revision: number;
+}
 
 /** One BrowserHost owns all neo targets and grants input only to the visible tab. */
 export class BrowserRuntime {
@@ -378,6 +383,10 @@ export class BrowserRuntime {
   private leaseGeneration = 0;
   private agentAllowed = true;
   private suppressMouseUp = false;
+  private pointerMove?: Promise<void>;
+  private latestMove?: Extract<BrowserInput, { type: 'mouse' }>;
+  private hoverEpoch = 0;
+  private workingFeedback?: ScopedElement & { ref: string };
   private recording?: Recording;
 
   constructor(private options: BrowserOptions) {}
@@ -672,8 +681,13 @@ export class BrowserRuntime {
     } else {
       entry.url = frame.url || entry.url;
       if (frame.parentId || parentId) entry.parentId = frame.parentId || parentId;
-      if (channel !== tab.page || !tab.children.has(entry.channel as BrowserFrameSession))
+      if (
+        entry.channel !== channel &&
+        (channel !== tab.page || !tab.children.has(entry.channel as BrowserFrameSession))
+      ) {
+        this.invalidateFrame(tab, entry);
         entry.channel = channel;
+      }
     }
     return entry;
   }
@@ -687,7 +701,7 @@ export class BrowserRuntime {
     const editCount = tab.edits.length;
     tab.edits = tab.edits.filter((edit) => edit.frameId !== frame.id);
     if (this.activeTabId === tab.info.id && this.state.selectedElement?.frameId === frame.id)
-      this.update({ selectedElement: undefined, inspecting: false });
+      this.update({ selectedElement: undefined });
     else if (this.activeTabId === tab.info.id && tab.edits.length !== editCount) this.update();
   }
   private async installChannel(
@@ -704,11 +718,20 @@ export class BrowserRuntime {
       if (c.name === WORLD && c.auxData?.frameId) {
         contexts.set(c.id, c.auxData.frameId);
         const f = tab.frames.get(c.auxData.frameId);
-        if (f) f.contextId = c.id;
+        if (f?.channel === channel) f.contextId = c.id;
       }
     });
-    channel.on('Runtime.executionContextDestroyed', (p) => contexts.delete(p.executionContextId));
-    channel.on('Runtime.executionContextsCleared', () => contexts.clear());
+    channel.on('Runtime.executionContextDestroyed', (p) => {
+      const frame = tab.frames.get(contexts.get(p.executionContextId) || '');
+      if (frame?.channel === channel && frame.contextId === p.executionContextId)
+        frame.contextId = undefined;
+      contexts.delete(p.executionContextId);
+    });
+    channel.on('Runtime.executionContextsCleared', () => {
+      for (const frame of tab.frames.values())
+        if (frame.channel === channel) frame.contextId = undefined;
+      contexts.clear();
+    });
     channel.on('Runtime.bindingCalled', (p) => {
       if (
         this.disposed ||
@@ -724,9 +747,28 @@ export class BrowserRuntime {
           (f) => f.channel === channel && f.contextId === p.executionContextId,
         )?.id;
       const frame = frameId && tab.frames.get(frameId);
-      if (!frame) return;
+      if (!frame || frame.channel !== channel) return;
       try {
-        this.recordEvent(tab, frame, JSON.parse(p.payload));
+        const payload = JSON.parse(p.payload);
+        if (payload.kind === 'hover-frame') {
+          if (
+            !this.state.inspecting ||
+            this.activeTabId !== tab.info.id ||
+            frame.documentId !== payload.docId
+          )
+            return;
+          for (const other of tab.frames.values()) {
+            if (other.id === frame.id || !other.contextId) continue;
+            void other.channel
+              .call('Runtime.evaluate', {
+                expression: 'globalThis.__workbenchPage?.leave()',
+                contextId: other.contextId,
+              })
+              .catch(() => {});
+          }
+          return;
+        }
+        this.recordEvent(tab, frame, payload);
       } catch {}
     });
     channel.on('Page.frameNavigated', (p) => {
@@ -750,6 +792,8 @@ export class BrowserRuntime {
         frameId: frame.id,
       });
       if (root && !p.frame.parentId) void this.refreshTab(tab);
+      else if (this.activeTabId === tab.info.id && this.state.inspecting)
+        void this.prepareFrame(tab, frame).catch(() => {});
     });
     channel.on('Page.frameDetached', (p) => {
       if (p.reason === 'swap') return;
@@ -892,52 +936,76 @@ export class BrowserRuntime {
       (frame) => present.has(frame.id) || frame.channel !== tab.page,
     );
   }
-  private async prepareFrame(tab: TabSession, frame: FrameContext): Promise<number> {
+  private async prepareFrame(tab: TabSession, frame: FrameContext): Promise<PreparedContext> {
     if (this.disposed || this.tabs.get(tab.info.id) !== tab) throw new Error('页面已关闭');
     for (let attempt = 0; attempt < 3; attempt++) {
+      const channel = frame.channel;
+      let revision = frame.revision;
+      const assertOwner = () => {
+        if (tab.frames.get(frame.id) !== frame) throw new Error('元素所在 iframe 已移除');
+        if (frame.channel !== channel || frame.revision !== revision)
+          throw new Error('Frame context changed during preparation');
+      };
       try {
-        const world = await frame.channel.call('Page.createIsolatedWorld', {
-          frameId: frame.id,
-          worldName: WORLD,
-        });
-        const contextId = world.executionContextId as number;
-        const ready = await frame.channel.call('Runtime.evaluate', {
+        assertOwner();
+        // A world survives many bridge calls; its document identity still needs validation.
+        const contextId =
+          frame.contextId ??
+          ((
+            await channel.call('Page.createIsolatedWorld', {
+              frameId: frame.id,
+              worldName: WORLD,
+            })
+          ).executionContextId as number);
+        assertOwner();
+        const ready = await channel.call('Runtime.evaluate', {
           expression:
             '({ready:typeof globalThis.__workbenchPage === "object" && typeof globalThis.__workbenchEvent === "function",documentId:globalThis.__workbenchPage?.docId})',
           contextId,
           returnByValue: true,
         });
+        assertOwner();
         if (ready.exceptionDetails) throw new Error(ready.exceptionDetails.text);
+        let documentId = ready.result.value?.documentId;
         if (!ready.result.value?.ready) {
-          await frame.channel.call('Runtime.addBinding', {
+          await channel.call('Runtime.addBinding', {
             name: '__workbenchEvent',
             executionContextId: contextId,
           });
-          const installed = await frame.channel.call('Runtime.evaluate', {
-            expression: browserPageSource,
+          assertOwner();
+          const installed = await channel.call('Runtime.evaluate', {
+            expression: `${browserPageSource}\nglobalThis.__workbenchPage.docId`,
             contextId,
+            returnByValue: true,
           });
+          assertOwner();
           if (installed.exceptionDetails)
             throw new Error(
               installed.exceptionDetails.exception?.description || installed.exceptionDetails.text,
             );
+          documentId = installed.result.value;
         }
-        const identity = await frame.channel.call('Runtime.evaluate', {
-          expression: 'globalThis.__workbenchPage.docId',
-          contextId,
-          returnByValue: true,
-        });
-        if (frame.documentId && frame.documentId !== identity.result.value)
+        if (typeof documentId !== 'string' || !documentId) throw new Error('页面框架身份无效');
+        const newDocument = frame.documentId !== documentId;
+        if (frame.documentId && frame.documentId !== documentId) {
           this.invalidateFrame(tab, frame);
-        frame.documentId = identity.result.value;
+          revision = frame.revision;
+        }
+        frame.documentId = documentId;
         frame.contextId = contextId;
-        return contextId;
+        if (newDocument)
+          await channel.call('Runtime.evaluate', {
+            expression: `globalThis.__workbenchPage.setInspect(${this.activeTabId === tab.info.id && this.state.inspecting})`,
+            contextId,
+          });
+        assertOwner();
+        return { contextId, channel, revision };
       } catch (error) {
-        frame.contextId = undefined;
+        if (frame.channel === channel && frame.revision === revision) frame.contextId = undefined;
         const message = error instanceof Error ? error.message : String(error);
         if (
           attempt === 2 ||
-          !/Cannot find (?:context|execution context)|Execution context was destroyed|No frame with given id|No frame for given id/i.test(
+          !/Cannot find (?:context|execution context)|Execution context was destroyed|No frame with given id|No frame for given id|Frame context changed during preparation/i.test(
             message,
           )
         )
@@ -947,20 +1015,35 @@ export class BrowserRuntime {
     }
     throw new Error('无法连接页面框架');
   }
+  private assertPreparedContext(
+    tab: TabSession,
+    frame: FrameContext,
+    prepared: PreparedContext,
+  ): void {
+    if (
+      tab.frames.get(frame.id) !== frame ||
+      frame.channel !== prepared.channel ||
+      frame.revision !== prepared.revision ||
+      frame.contextId !== prepared.contextId
+    )
+      throw new Error('页面框架已改变，请重新获取元素。');
+  }
   private async bridge<T = any>(
     tab: TabSession,
     frame: FrameContext,
     expression: string,
     guard?: () => void,
   ): Promise<T> {
-    const contextId = await this.prepareFrame(tab, frame);
+    const prepared = await this.prepareFrame(tab, frame);
     guard?.();
-    const result = await frame.channel.call('Runtime.evaluate', {
+    this.assertPreparedContext(tab, frame, prepared);
+    const result = await prepared.channel.call('Runtime.evaluate', {
       expression,
-      contextId,
+      contextId: prepared.contextId,
       returnByValue: true,
       awaitPromise: true,
     });
+    this.assertPreparedContext(tab, frame, prepared);
     if (result.exceptionDetails)
       throw new Error(
         result.exceptionDetails.exception?.description || result.exceptionDetails.text,
@@ -1004,7 +1087,7 @@ export class BrowserRuntime {
   }
   private async clearOutline(tab: TabSession): Promise<void> {
     for (const frame of tab.frames.values())
-      await this.bridge(tab, frame, 'globalThis.__workbenchPage.outline(null)').catch(() => {});
+      await this.bridge(tab, frame, 'globalThis.__workbenchPage.clearOverlays()').catch(() => {});
   }
   private async activateTab(
     tab: TabSession,
@@ -1251,20 +1334,24 @@ export class BrowserRuntime {
     const parent = frame.parentId && tab.frames.get(frame.parentId);
     if (!parent) throw new Error('无法定位此 iframe 的父页面');
     const base = await this.geometry(tab, parent);
-    const owner = await parent.channel.call('DOM.getFrameOwner', { frameId: frame.id });
-    const contextId = await this.prepareFrame(tab, parent);
-    const node = await parent.channel.call('DOM.resolveNode', {
+    const prepared = await this.prepareFrame(tab, parent);
+    this.assertPreparedContext(tab, parent, prepared);
+    const owner = await prepared.channel.call('DOM.getFrameOwner', { frameId: frame.id });
+    this.assertPreparedContext(tab, parent, prepared);
+    const node = await prepared.channel.call('DOM.resolveNode', {
       backendNodeId: owner.backendNodeId,
-      executionContextId: contextId,
+      executionContextId: prepared.contextId,
     });
     if (!node.object.objectId) throw new Error('无法定位 iframe 元素');
     try {
-      const result = await parent.channel.call('Runtime.callFunctionOn', {
+      this.assertPreparedContext(tab, parent, prepared);
+      const result = await prepared.channel.call('Runtime.callFunctionOn', {
         objectId: node.object.objectId,
         functionDeclaration:
           'function(){const r=this.getBoundingClientRect();const t=getComputedStyle(this).transform;if(t!=="none"){const m=new DOMMatrix(t);if(!m.is2D||Math.abs(m.b)>0.0001||Math.abs(m.c)>0.0001)throw new Error("Rotated or 3D iframe coordinates are not supported");}const sx=r.width/this.offsetWidth,sy=r.height/this.offsetHeight;return{x:r.x+this.clientLeft*sx,y:r.y+this.clientTop*sy,scaleX:sx,scaleY:sy};}',
         returnByValue: true,
       });
+      this.assertPreparedContext(tab, parent, prepared);
       if (result.exceptionDetails)
         throw new Error(
           result.exceptionDetails.exception?.description || result.exceptionDetails.text,
@@ -1279,7 +1366,7 @@ export class BrowserRuntime {
         scaleY: base.scaleY * box.scaleY,
       };
     } finally {
-      await parent.channel
+      await prepared.channel
         .call('Runtime.releaseObject', { objectId: node.object.objectId })
         .catch(() => {});
     }
@@ -1324,20 +1411,23 @@ export class BrowserRuntime {
     for (let depth = 0; depth < 10; depth++) {
       const offset = await this.geometry(tab, frame);
       const local = { x: (x - offset.x) / offset.scaleX, y: (y - offset.y) / offset.scaleY };
-      const contextId = await this.prepareFrame(tab, frame);
-      const hit = await frame.channel.call('Runtime.evaluate', {
+      const prepared = await this.prepareFrame(tab, frame);
+      this.assertPreparedContext(tab, frame, prepared);
+      const hit = await prepared.channel.call('Runtime.evaluate', {
         expression: `(()=>{let el=document.elementFromPoint(${local.x},${local.y});while(el?.shadowRoot){const next=el.shadowRoot.elementFromPoint(${local.x},${local.y});if(!next||next===el)break;el=next;}return el;})()`,
-        contextId,
+        contextId: prepared.contextId,
       });
+      this.assertPreparedContext(tab, frame, prepared);
       if (!hit.result.objectId) return frame;
       let childId: string | undefined;
       try {
-        const described = await frame.channel.call('DOM.describeNode', {
+        const described = await prepared.channel.call('DOM.describeNode', {
           objectId: hit.result.objectId,
         });
+        this.assertPreparedContext(tab, frame, prepared);
         childId = described.node.frameId;
       } finally {
-        await frame.channel
+        await prepared.channel
           .call('Runtime.releaseObject', { objectId: hit.result.objectId })
           .catch(() => {});
       }
@@ -1420,6 +1510,72 @@ export class BrowserRuntime {
     if (input.tabId !== undefined && input.tabId !== id)
       return Promise.reject(new Error('忽略了来自旧标签页的输入。'));
     if (input.type === 'resize') return this.resize(input.width, input.height);
+    if (input.type === 'mouse') this.hoverEpoch++;
+    if (input.type === 'mouse' && input.action === 'leave') {
+      const tab = this.activeTab(),
+        epoch = this.hoverEpoch,
+        activation = tab.activation;
+      this.latestMove = undefined;
+      const cleared = this.clearHover(tab, epoch, activation);
+      // Hover acknowledgements can wait on a resize; cleanup must never block page actions.
+      if (this.pointerMove)
+        void this.pointerMove
+          .then(
+            () => this.clearHover(tab, epoch, activation),
+            () => this.clearHover(tab, epoch, activation),
+          )
+          .catch(() => {});
+      return cleared;
+    }
+    if (
+      input.type === 'mouse' &&
+      input.button &&
+      !['left', 'middle', 'right'].includes(input.button)
+    )
+      return Promise.reject(new Error('Invalid mouse button'));
+    if (
+      input.type === 'mouse' &&
+      input.buttons !== undefined &&
+      (!Number.isInteger(input.buttons) || input.buttons < 0 || input.buttons > 31)
+    )
+      return Promise.reject(new Error('Invalid mouse buttons'));
+    if (input.type === 'mouse' && input.action === 'move' && !input.buttons) {
+      if (
+        ![input.x, input.y].every(Number.isFinite) ||
+        input.x < 0 ||
+        input.y < 0 ||
+        input.x > this.width ||
+        input.y > this.height
+      )
+        return Promise.reject(new Error('Pointer is outside the browser viewport'));
+      if (
+        input.modifiers !== undefined &&
+        (!Number.isInteger(input.modifiers) || input.modifiers < 0 || input.modifiers > 15)
+      )
+        return Promise.reject(new Error('Invalid keyboard modifiers'));
+      this.latestMove = { ...input, tabId: id };
+      if (!this.pointerMove) {
+        this.pointerMove = (async () => {
+          while (this.latestMove) {
+            const move = this.latestMove;
+            this.latestMove = undefined;
+            const tab = this.tabs.get(move.tabId!);
+            if (!tab || this.activeTabId !== move.tabId) continue;
+            await tab.page.call('Input.dispatchMouseEvent', {
+              type: 'mouseMoved',
+              x: move.x,
+              y: move.y,
+              button: move.buttons ? move.button || 'left' : 'none',
+              buttons: move.buttons || 0,
+              modifiers: move.modifiers || 0,
+            });
+          }
+        })().finally(() => {
+          this.pointerMove = undefined;
+        });
+      }
+      return this.pointerMove;
+    }
     if (
       (input.type === 'mouse' && input.action === 'down') ||
       input.type === 'text' ||
@@ -1431,6 +1587,10 @@ export class BrowserRuntime {
       );
     return this.serialize(async () => {
       const tab = this.requireActive(id);
+      if (input.type === 'key' && input.key === 'Escape' && this.state.inspecting) {
+        if (input.action === 'down') await this.setInspectInternal(tab, false);
+        return;
+      }
       if (input.type === 'mouse' && input.action === 'up' && this.suppressMouseUp) {
         this.suppressMouseUp = false;
         return;
@@ -1460,14 +1620,17 @@ export class BrowserRuntime {
         if (this.state.inspecting && input.action === 'down') {
           const element = await this.atPoint(tab, input.x, input.y);
           this.suppressMouseUp = true;
-          if (element) await this.selectElementInternal(element.ref);
+          if (element) await this.selectElementInternal(element.ref, false);
           return;
         }
         await tab.page.call('Input.dispatchMouseEvent', {
-          type: { move: 'mouseMoved', down: 'mousePressed', up: 'mouseReleased' }[input.action],
+          type: { move: 'mouseMoved', down: 'mousePressed', up: 'mouseReleased' }[
+            input.action as 'move' | 'down' | 'up'
+          ],
           x: input.x,
           y: input.y,
           button: input.button || 'left',
+          ...(input.buttons !== undefined ? { buttons: input.buttons } : {}),
           clickCount: input.action === 'move' ? 0 : Math.min(3, Math.max(1, input.clickCount || 1)),
           modifiers: input.modifiers || 0,
         });
@@ -1508,13 +1671,68 @@ export class BrowserRuntime {
       } else throw new Error('Unsupported browser input');
     });
   }
+  private async clearHover(tab: TabSession, epoch: number, activation: number): Promise<void> {
+    if (
+      this.hoverEpoch !== epoch ||
+      this.activeTabId !== tab.info.id ||
+      tab.activation !== activation
+    )
+      return;
+    await Promise.allSettled(
+      [...tab.frames.values()]
+        .filter((frame) => frame.contextId)
+        .map((frame) =>
+          frame.channel.call('Runtime.evaluate', {
+            expression: 'globalThis.__workbenchPage?.leave()',
+            contextId: frame.contextId,
+          }),
+        ),
+    );
+  }
   setInspect(enabled: boolean): Promise<void> {
     const id = this.activeTab().info.id;
+    return this.serialize(() => this.setInspectInternal(this.requireActive(id), !!enabled));
+  }
+  private async setInspectInternal(tab: TabSession, enabled: boolean): Promise<void> {
+    const frames = await this.collectFrames(tab);
+    await Promise.all(
+      frames.map((frame) =>
+        this.bridge(tab, frame, `globalThis.__workbenchPage.setInspect(${enabled})`).catch(
+          () => {},
+        ),
+      ),
+    );
+    this.update({ inspecting: enabled });
+  }
+  setElementFeedback(ref: string, phase: 'working' | null): Promise<void> {
     return this.serialize(async () => {
-      const tab = this.requireActive(id);
-      this.update({ inspecting: !!enabled });
-      if (!enabled) await this.clearOutline(tab);
+      if (phase === 'working') {
+        const { tab, frame, scope } = await this.resolveRef(ref);
+        if (this.workingFeedback && this.workingFeedback.ref !== ref)
+          await this.clearWorkingFeedback(this.workingFeedback);
+        this.workingFeedback = { ...scope, ref };
+        await this.bridge(
+          tab,
+          frame,
+          `globalThis.__workbenchPage.feedback(${JSON.stringify(scope.localRef)},'working')`,
+        );
+        return;
+      }
+      const scope = this.workingFeedback;
+      if (!scope || scope.ref !== ref) return;
+      this.workingFeedback = undefined;
+      await this.clearWorkingFeedback(scope);
     });
+  }
+  private async clearWorkingFeedback(scope: ScopedElement): Promise<void> {
+    const tab = this.tabs.get(scope.tabId),
+      frame = tab?.frames.get(scope.frameId);
+    if (!tab || !frame || frame.documentId !== scope.documentId) return;
+    await this.bridge(
+      tab,
+      frame,
+      `globalThis.__workbenchPage.feedback(${JSON.stringify(scope.localRef)},null)`,
+    ).catch(() => {});
   }
 
   snapshot(): Promise<ToolResult> {
@@ -1717,15 +1935,17 @@ export class BrowserRuntime {
     this.humanTakeover('inspect');
     return this.serialize(() => this.selectElementInternal(ref));
   }
-  private async selectElementInternal(ref: string): Promise<ElementDetails> {
+  private async selectElementInternal(ref: string, reveal = true): Promise<ElementDetails> {
     const { tab, frame, scope } = await this.resolveRef(ref);
     await this.setSource(tab, 'human');
-    await this.revealFrame(tab, frame);
-    await this.bridge(
-      tab,
-      frame,
-      `globalThis.__workbenchPage.reveal(${JSON.stringify(scope.localRef)})`,
-    );
+    if (reveal) {
+      await this.revealFrame(tab, frame);
+      await this.bridge(
+        tab,
+        frame,
+        `globalThis.__workbenchPage.reveal(${JSON.stringify(scope.localRef)})`,
+      );
+    }
     await this.clearOutline(tab);
     await this.bridge(
       tab,

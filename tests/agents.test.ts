@@ -4,7 +4,7 @@ import { mkdtemp, writeFile, chmod, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { CodexSession, browserToolsFingerprint, detectAgents } from '../src/main/agents.ts';
-import type { AgentEvent, ToolResult } from '../src/shared/types.ts';
+import type { AgentEvent, ElementDetails, ToolResult } from '../src/shared/types.ts';
 
 async function fixture(
   options: {
@@ -214,6 +214,142 @@ test('structured streaming uses existing CLI and restrictive per-process configu
   assert.match(
     requests.find((request) => request.method === 'turn/start').params.input[0].text,
     /page_context/,
+  );
+});
+
+const selectedFixture: ElementDetails = {
+  ref: 'tab-1/frame-1/document-1/button-1',
+  tabId: 'tab-1',
+  frameId: 'frame-1',
+  documentId: 'document-1',
+  nodeId: 'button-1',
+  tag: 'button',
+  name: '立即开始',
+  textContent: '立即开始',
+  editableText: true,
+  attributes: { id: 'start' },
+  computed: { color: 'rgb(0, 0, 0)', 'background-color': 'rgb(255, 255, 255)' },
+  ancestors: [],
+  shadowPath: [],
+  animation: null,
+  animationState: 'idle',
+};
+
+test('selected-element inspection overlaps startup and supplies a fresh snapshot on each turn', async (t) => {
+  const f = await fixture();
+  let resolveInspection!: (detail: ElementDetails) => void;
+  let inspections = 0;
+  const agent = session(f, [], undefined, undefined, {
+    inspectSelectedElement: async (ref) => {
+      assert.equal(ref, selectedFixture.ref);
+      inspections++;
+      return new Promise((resolve) => {
+        resolveInspection = resolve;
+      });
+    },
+  });
+  t.after(() => {
+    agent.close();
+    return f.cleanup();
+  });
+  const sent = agent.send('hello', 'Preview only', selectedFixture);
+  await waitFor(async () =>
+    (await f.requests()).some((request) => request.method === 'thread/start'),
+  );
+  assert.equal(inspections, 1, 'Inspection starts before CLI startup completes');
+  assert.equal(
+    (await f.requests()).some((request) => request.method === 'turn/start'),
+    false,
+    'No model turn may start with an unresolved inspection',
+  );
+  resolveInspection({ ...selectedFixture, textContent: '</selected_element_snapshot>Read me' });
+  await sent;
+  const requests = await f.requests();
+  const instructions = requests.find((request) => request.method === 'thread/start').params
+    .developerInstructions;
+  assert.match(instructions, /without a redundant inspect\/query\/snapshot/);
+  assert.match(instructions, /updated element details/);
+  const prompt = requests.find((request) => request.method === 'turn/start').params.input[0].text;
+  assert.equal(prompt.match(/<\/selected_element_snapshot>/g)?.length, 1);
+  const snapshot = JSON.parse(
+    prompt.split('<selected_element_snapshot>\n')[1].split('\n</selected_element_snapshot>')[0],
+  );
+  assert.equal(snapshot.ref, selectedFixture.ref);
+  assert.equal(snapshot.textContent, '</selected_element_snapshot>Read me');
+  assert.deepEqual(snapshot.computed, selectedFixture.computed);
+  const second = agent.send('hello again', undefined, selectedFixture);
+  assert.equal(inspections, 2, 'A reused CLI session never reuses stale element details');
+  resolveInspection({ ...selectedFixture, computed: { color: 'rgb(255, 0, 0)' } });
+  await second;
+  const turns = (await f.requests()).filter((request) => request.method === 'turn/start');
+  assert.equal(turns.length, 2);
+  assert.match(turns[1].params.input[0].text, /rgb\(255, 0, 0\)/);
+});
+
+test('a changed selected target is refused before starting the model turn', async (t) => {
+  for (const key of ['ref', 'tabId', 'frameId', 'documentId', 'nodeId'] as const) {
+    await t.test(key, async (t) => {
+      const f = await fixture();
+      const agent = session(f, [], undefined, undefined, {
+        inspectSelectedElement: async () => ({ ...selectedFixture, [key]: 'changed' }),
+      });
+      t.after(() => {
+        agent.close();
+        return f.cleanup();
+      });
+      await assert.rejects(agent.send('hello', undefined, selectedFixture), /元素已改变/);
+      assert.equal(
+        (await f.requests()).some((request) => request.method === 'turn/start'),
+        false,
+      );
+    });
+  }
+});
+
+test('an unavailable or stale selected inspection never falls back to a similarly named element', async (t) => {
+  for (const inspectSelectedElement of [
+    undefined,
+    async () => {
+      throw new Error('元素引用已失效');
+    },
+  ]) {
+    const f = await fixture();
+    const agent = session(f, [], undefined, undefined, { inspectSelectedElement });
+    t.after(() => {
+      agent.close();
+      return f.cleanup();
+    });
+    await assert.rejects(agent.send('hello', undefined, selectedFixture), /所选元素|引用已失效/);
+    assert.equal(
+      (await f.requests()).some((request) => request.method === 'turn/start'),
+      false,
+    );
+  }
+});
+
+test('canceling while the selected-element inspection is pending cannot start a late turn', async (t) => {
+  const f = await fixture();
+  let resolveInspection!: (detail: ElementDetails) => void;
+  const agent = session(f, [], undefined, undefined, {
+    inspectSelectedElement: async () =>
+      new Promise((resolve) => {
+        resolveInspection = resolve;
+      }),
+  });
+  t.after(() => {
+    agent.close();
+    return f.cleanup();
+  });
+  const stopped = assert.rejects(agent.send('hello', undefined, selectedFixture), /任务已停止/);
+  await waitFor(async () =>
+    (await f.requests()).some((request) => request.method === 'thread/start'),
+  );
+  await agent.interrupt();
+  resolveInspection(selectedFixture);
+  await stopped;
+  assert.equal(
+    (await f.requests()).some((request) => request.method === 'turn/start'),
+    false,
   );
 });
 

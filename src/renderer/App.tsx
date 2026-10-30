@@ -423,6 +423,9 @@ export default function App() {
     setSelectedEdit(undefined);
   }, [browser.url, browser.activeTabId]);
   useEffect(() => {
+    if (!browserVisible && browser.inspecting) void action('browser:inspect', { enabled: false });
+  }, [browserVisible, browser.inspecting, action]);
+  useEffect(() => {
     if (!panels.current) return;
     const observer = new ResizeObserver(([entry]) => setPanelWidth(entry.contentRect.width));
     observer.observe(panels.current);
@@ -482,12 +485,13 @@ export default function App() {
   const send = async () => {
     if (!draft.trim() || busy) return;
     const context = selected
-      ? `用户选中了网页元素：${JSON.stringify(selected)}\n页面预览修改（仅当前DOM，不代表源码已保存）：${JSON.stringify(selectedEdit ?? null)}\n当前页面：${pageSource(browser.url)}\n请先核实当前项目与此页面的对应关系；若用户要求改源码，定位真实组件、修改文件并在浏览器验证。不要把DOM预览当成源码修改。`
+      ? `选中元素引用：${selected.ref}\n页面预览修改（仅当前DOM，不代表源码已保存）：${JSON.stringify(selectedEdit ?? null)}\n当前页面：${pageSource(browser.url)}\n页面效果调整直接使用元素编辑工具。仅当用户要求修改或保存到源码时，核实项目与页面的对应关系、定位真实组件并验证修改；不要把DOM预览当成源码修改。`
       : undefined;
     const result = await action<{ conversationId: string }>('conversation:send', {
       id: conversationId,
       text: draft.trim(),
       context,
+      selectedRef: selected?.ref,
     });
     if (result) {
       setConversationId(result.conversationId);
@@ -1008,6 +1012,7 @@ export default function App() {
               recordings={recordings}
               liveSteps={liveSteps}
               initialFrame={lastFrame.current}
+              agentStatus={busy ? statusLabel || '正在处理' : undefined}
               onAction={action}
               onOpenSettings={() => setSettingsTab('browser')}
               onAnalyze={(id) => void analyze(id)}

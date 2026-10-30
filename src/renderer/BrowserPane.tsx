@@ -37,6 +37,7 @@ interface Props {
   onClose: () => void;
   onSourceRequest: (element: ElementDetails, changes?: ElementEdit) => void;
   initialFrame?: BrowserFrame;
+  agentStatus?: string;
 }
 function modifiers(event: {
   altKey: boolean;
@@ -61,6 +62,7 @@ export function BrowserPane({
   onClose,
   onSourceRequest,
   initialFrame,
+  agentStatus,
 }: Props) {
   const [url, setUrl] = useState(state.url);
   const [mode, setMode] = useState<'page' | 'recordings'>('page');
@@ -83,6 +85,7 @@ export function BrowserPane({
   const compositionTab = useRef<string | undefined>(undefined);
   const compositionCommit = useRef<{ value: string; time: number } | undefined>(undefined);
   const pointerFrame = useRef<number>(0);
+  const inspectPending = useRef(false);
   const busy = state.status === 'starting' || state.loading;
   const ready = state.status === 'ready';
   const recording = recordings.find((item) => item.id === recordingId) || recordings[0];
@@ -102,6 +105,25 @@ export function BrowserPane({
         .catch(() => {});
   };
 
+  useEffect(() => {
+    const cancel = (event: KeyboardEvent) => {
+      if (
+        event.key !== 'Escape' ||
+        (!state.inspecting && !inspectPending.current) ||
+        document.querySelector('dialog[open]')
+      )
+        return;
+      event.preventDefault();
+      event.stopPropagation();
+      void onAction('browser:inspect', { enabled: false });
+    };
+    window.addEventListener('keydown', cancel, true);
+    return () => window.removeEventListener('keydown', cancel, true);
+  }, [state.inspecting, onAction]);
+  useEffect(() => {
+    if (mode !== 'page' && state.inspecting) void onAction('browser:inspect', { enabled: false });
+  }, [mode, state.inspecting, onAction]);
+  useEffect(() => () => cancelAnimationFrame(pointerFrame.current), []);
   useEffect(() => {
     if (document.activeElement !== address.current)
       setUrl(state.url === 'about:blank' ? '' : state.url);
@@ -219,6 +241,7 @@ export function BrowserPane({
       action,
       ...point(event),
       button: event.button === 2 ? 'right' : event.button === 1 ? 'middle' : 'left',
+      buttons: event.buttons,
       clickCount: action === 'move' ? 0 : event.detail || 1,
       modifiers: modifiers(event),
     };
@@ -440,8 +463,10 @@ export function BrowserPane({
             disabled={!ready}
             onClick={() => {
               setMode('page');
-              setInspectorOpen(true);
-              void onAction('browser:inspect', { enabled: !state.inspecting });
+              inspectPending.current = true;
+              void onAction('browser:inspect', { enabled: !state.inspecting }).finally(() => {
+                inspectPending.current = false;
+              });
             }}
           >
             <MousePointer2 size={14} />
@@ -462,7 +487,8 @@ export function BrowserPane({
           {state.inspecting && (
             <div className="inspect-tip">
               <MousePointer2 size={13} />
-              点击元素，查看定位与可修改属性
+              悬停预览，点击选中
+              <kbd>Esc 取消</kbd>
               <button
                 aria-label="取消选取"
                 onClick={() => void onAction('browser:inspect', { enabled: false })}
@@ -477,6 +503,10 @@ export function BrowserPane({
             onMouseDown={(event) => pointer(event, 'down')}
             onMouseUp={(event) => pointer(event, 'up')}
             onMouseMove={(event) => pointer(event, 'move')}
+            onMouseLeave={() => {
+              cancelAnimationFrame(pointerFrame.current);
+              if (state.inspecting) sendInput({ type: 'mouse', action: 'leave', x: 0, y: 0 });
+            }}
             onContextMenu={(event) => event.preventDefault()}
           >
             <img
@@ -586,7 +616,14 @@ export function BrowserPane({
                   ? '正在连接'
                   : '未连接'}
             </span>
-            {state.inspecting && <span className="status-right">选择元素</span>}
+            {state.inspecting ? (
+              <span className="status-right">选择元素</span>
+            ) : agentStatus ? (
+              <span className="browser-agent-status" role="status">
+                <span className="thinking-dot" />
+                {agentStatus}
+              </span>
+            ) : null}
           </div>
         </div>
       ) : (

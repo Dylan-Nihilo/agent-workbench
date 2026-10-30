@@ -224,10 +224,11 @@ export interface BrowserFrame {
 export type BrowserInput = (
   | {
       type: 'mouse';
-      action: 'move' | 'down' | 'up';
+      action: 'move' | 'down' | 'up' | 'leave';
       x: number;
       y: number;
       button?: 'left' | 'middle' | 'right';
+      buttons?: number;
       clickCount?: number;
       modifiers?: number;
     }

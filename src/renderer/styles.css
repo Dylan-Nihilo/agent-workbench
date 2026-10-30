@@ -1511,6 +1511,21 @@ kbd {
   margin-left: auto;
   white-space: nowrap;
 }
+.browser-agent-status {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--secondary);
+}
+.browser-agent-status .thinking-dot {
+  flex-shrink: 0;
+}
 .inspect-tip {
   position: absolute;
   z-index: 3;
@@ -1533,6 +1548,12 @@ kbd {
   color: #d6e0ff;
   display: grid;
   place-items: center;
+}
+.inspect-tip kbd {
+  margin-left: 3px;
+  font: inherit;
+  font-size: 10px;
+  opacity: 0.72;
 }
 .browser-unavailable {
   position: absolute;

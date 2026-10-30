@@ -824,3 +824,144 @@ test(
     await assert.rejects(bridge(page, 'inspect', childElement.ref), /old document/);
   },
 );
+
+test('hover previews deep nodes and selection tracks layout without touching the target', async (t) => {
+  if (!browser) return t.skip('Browser binary unavailable');
+  const { page, find } = await fixture(t);
+  await captureOverlayRoot(page);
+  const leaf = await find('#deep-leaf');
+  await bridge(page, 'setInspect', true);
+  await page.mouse.move(leaf.bounds.x + 10, leaf.bounds.y + 10);
+  await page.waitForFunction(() => {
+    const root = (globalThis as any).__overlayRoot as ShadowRoot | undefined;
+    return root?.querySelector<HTMLElement>('[data-kind="hover"]')?.style.display === 'block';
+  });
+  let hover = await readOverlay(page, 'hover');
+  assert.equal(
+    hover.label,
+    'span · ' + Math.round(leaf.bounds.width) + ' × ' + Math.round(leaf.bounds.height),
+  );
+  assert(Math.abs(hover.x - leaf.bounds.x) < 1);
+  assert(Math.abs(hover.y - leaf.bounds.y) < 1);
+  const before = await page.locator('#leaf').getAttribute('style');
+  const selected = await find('#leaf');
+  await bridge(page, 'setInspect', false);
+  await bridge(page, 'outline', selected.ref);
+  await page.locator('#leaf').evaluate((el) => {
+    el.parentElement!.style.paddingTop = '31px';
+  });
+  await page.waitForFunction(() => {
+    const box = (globalThis as any).__overlayRoot.querySelector('[data-kind="selected"]');
+    return (
+      Math.abs(
+        (box?.getBoundingClientRect().y ?? -9999) -
+          document.querySelector('#leaf')!.getBoundingClientRect().y,
+      ) < 1
+    );
+  });
+  assert.equal(await page.locator('#leaf').getAttribute('style'), before);
+  assert.equal((await readOverlay(page, 'hover')).visible, false);
+  await page.evaluate(() => {
+    document.body.style.minHeight = '2000px';
+    window.scrollTo(0, 80);
+  });
+  await page.waitForFunction(() => {
+    const box = (globalThis as any).__overlayRoot.querySelector('[data-kind="selected"]');
+    return (
+      Math.abs(
+        (box?.getBoundingClientRect().y ?? -9999) -
+          document.querySelector('#leaf')!.getBoundingClientRect().y,
+      ) < 1
+    );
+  });
+  await bridge(page, 'setInspect', true);
+  await page.mouse.move(100, 100);
+  await bridge(page, 'leave');
+  await page.waitForFunction(
+    () =>
+      (globalThis as any).__overlayRoot.querySelector('[data-kind="hover"]').style.display ===
+      'none',
+  );
+  await page.locator('#leaf').evaluate((el) => el.remove());
+  await page.waitForFunction(
+    () =>
+      (globalThis as any).__overlayRoot.querySelector('[data-kind="selected"]').style.display ===
+      'none',
+  );
+  await bridge(page, 'clearOverlays');
+  assert.equal(await page.locator('[data-workbench-overlay]').count(), 0);
+});
+
+test('element feedback is temporary, respects reduced motion, and preserves website animations', async (t) => {
+  if (!browser) return t.skip('Browser binary unavailable');
+  const { page, find } = await fixture(t);
+  await captureOverlayRoot(page);
+  const leaf = await find('#leaf');
+  const other = await find('#heading');
+  const before = await page.locator('#leaf').getAttribute('style');
+  await page.locator('#leaf').evaluate((el) => {
+    (globalThis as any).__websiteAnimation = el.animate([{ opacity: 1 }, { opacity: 0.8 }], {
+      duration: 1000,
+      iterations: Infinity,
+    });
+  });
+  await bridge(page, 'feedback', leaf.ref, 'working');
+  const effect = await readOverlay(page, 'feedback');
+  assert.equal(effect.visible, true);
+  assert.equal(effect.sweep, 'sweep');
+  assert.equal(await page.locator('#leaf').getAttribute('style'), before);
+  assert.equal(
+    await page.evaluate(() => (globalThis as any).__websiteAnimation.playState),
+    'running',
+  );
+  await bridge(page, 'feedback', other.ref, 'working');
+  await bridge(page, 'feedback', leaf.ref, null);
+  assert.equal(
+    (await readOverlay(page, 'feedback')).visible,
+    true,
+    'old target cleanup cannot clear the current target',
+  );
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  assert.equal((await readOverlay(page, 'feedback')).sweep, 'none');
+  const edit = await bridge<EditResult>(page, 'edit', { ref: leaf.ref, text: '修改完成' });
+  assert.equal((await readOverlay(page, 'feedback')).visible, true);
+  await page.waitForFunction(
+    () =>
+      (globalThis as any).__overlayRoot.querySelector('[data-kind="feedback"]').style.display ===
+      'none',
+  );
+  await bridge(page, 'undo', edit.editId);
+  assert.equal(await page.locator('#leaf').getAttribute('style'), before);
+  assert.equal(
+    await page.evaluate(() => (globalThis as any).__websiteAnimation.playState),
+    'running',
+  );
+  const snapshot = await bridge<{ text: string }>(page, 'snapshot');
+  assert(!snapshot.text.includes('span ·'));
+});
+
+async function captureOverlayRoot(page: Page) {
+  await page.evaluate(() => {
+    const original = Element.prototype.attachShadow;
+    Element.prototype.attachShadow = function (init) {
+      const root = original.call(this, init);
+      if (this.hasAttribute('data-workbench-overlay')) (globalThis as any).__overlayRoot = root;
+      return root;
+    };
+  });
+}
+async function readOverlay(page: Page, kind: string) {
+  return page.evaluate((kind) => {
+    const box = (globalThis as any).__overlayRoot.querySelector(
+      `[data-kind="${kind}"]`,
+    ) as HTMLElement;
+    const rect = box.getBoundingClientRect();
+    return {
+      visible: getComputedStyle(box).display !== 'none',
+      x: rect.x,
+      y: rect.y,
+      label: box.querySelector('span')?.textContent,
+      sweep: getComputedStyle(box, '::after').animationName,
+    };
+  }, kind);
+}

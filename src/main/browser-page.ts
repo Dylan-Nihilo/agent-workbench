@@ -33,7 +33,11 @@ export const browserPageSource = String.raw`(() => {
   let nextAnimationId = 0;
   let source = 'human';
   let maskNodes = [];
-  let outline;
+  let inspecting = false;
+  let overlayHost, overlayRoot, overlayFrame = 0;
+  let hoverElement, selectedElement, feedbackElement, feedbackPhase, feedbackTimer;
+  let hoverPoint;
+  const overlayBoxes = {};
   const clean = (text, limit=180) => String(text ?? '').replace(/Bearer\s+\S+/gi, 'Bearer [hidden]').replace(/(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]+/g, '[hidden]').replace(/\b(password|secret|token|api[_-]?key)\s*[:=]\s*[^\s,;]+/gi, '$1=[hidden]').slice(0, limit);
   const parent = el => el.parentElement || (el.getRootNode() instanceof ShadowRoot ? el.getRootNode().host : null);
   const leafText = el => [...el.childNodes].filter(node=>node.nodeType===Node.TEXT_NODE).map(node=>node.nodeValue || '').join('');
@@ -191,6 +195,77 @@ export const browserPageSource = String.raw`(() => {
   function eventTarget(event) {
     return event.composedPath().find(node=>node instanceof Element && !overlays.has(node)) || null;
   }
+  function overlayBox(kind) {
+    if (!overlayHost?.isConnected) {
+      overlayHost=document.createElement('div'); overlays.add(overlayHost);
+      overlayHost.setAttribute('data-workbench-overlay',''); overlayHost.setAttribute('aria-hidden','true');
+      overlayHost.style.cssText='all:initial!important;position:fixed!important;inset:0!important;pointer-events:none!important;z-index:2147483647!important;contain:layout style!important;';
+      overlayRoot=overlayHost.attachShadow({mode:'closed'});
+      const css=document.createElement('style');
+      css.textContent=':host{pointer-events:none}.box{position:absolute;box-sizing:border-box;pointer-events:none;border-radius:4px;display:none}.hover{border:1px solid #8291ed;background:#7e8dfa18;box-shadow:0 0 0 1px #fff9}.selected{border:2px solid #7e8dfa;box-shadow:0 0 0 1px #151b3480}.label{position:absolute;left:0;bottom:calc(100% + 5px);max-width:min(320px,90vw);box-sizing:border-box;padding:4px 7px;background:#202639;color:#fff;border:1px solid #6471b1;border-radius:5px;font:500 11px/16px ui-monospace,SFMono-Regular,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.feedback{overflow:hidden;border:1px solid #b6bcff;background:#969fff13;box-shadow:0 0 0 1px #7e8dfa66,0 0 18px #9ba5ff55}.feedback::after{content:"";position:absolute;inset:-60% -80%;background:linear-gradient(110deg,transparent 35%,#e6e9ff80 49%,transparent 63%);transform:translateX(-60%);animation:sweep 1.4s ease-in-out infinite}.feedback.applied{animation:finish 560ms ease-out both}.feedback.applied::after{animation:sweep 500ms ease-out both}@keyframes sweep{to{transform:translateX(60%)}}@keyframes finish{0%{opacity:1;box-shadow:0 0 0 1px #bac2ff,0 0 22px #a5b2ff88}100%{opacity:0;box-shadow:0 0 0 5px #bac2ff00,0 0 8px #a5b2ff00}}@media(prefers-reduced-motion:reduce){.feedback,.feedback::after{animation:none!important}.feedback::after{display:none}.feedback.applied{background:#b5bfff22}}';
+      overlayRoot.appendChild(css); document.documentElement.appendChild(overlayHost);
+      for(const name of Object.keys(overlayBoxes)) delete overlayBoxes[name];
+    }
+    if(!overlayBoxes[kind]) {
+      const box=document.createElement('div'); box.className='box '+kind; box.dataset.kind=kind;
+      if(kind!=='feedback') { const label=document.createElement('span');label.className='label';box.appendChild(label); }
+      overlayRoot.appendChild(box);overlayBoxes[kind]=box;
+    }
+    return overlayBoxes[kind];
+  }
+  function drawOverlay(kind,el) {
+    if(!el?.isConnected || !visible(el)) { if(overlayBoxes[kind]) {overlayBoxes[kind].style.display='none';overlayBoxes[kind].lastBounds='';}return; }
+    const rect=el.getBoundingClientRect();
+    const left=Math.max(0,rect.left),top=Math.max(0,rect.top),right=Math.min(innerWidth,rect.right),bottom=Math.min(innerHeight,rect.bottom);
+    if(right<=left || bottom<=top) { if(overlayBoxes[kind]) {overlayBoxes[kind].style.display='none';overlayBoxes[kind].lastBounds='';}return; }
+    const box=overlayBox(kind);
+    const css='display:block;left:'+left+'px;top:'+top+'px;width:'+(right-left)+'px;height:'+(bottom-top)+'px;';
+    if(box.lastBounds!==css) {box.style.cssText=css;box.lastBounds=css;}
+    if(kind!=='feedback') {
+      const label=box.firstChild;
+      const text=el.localName+' · '+Math.round(rect.width)+' × '+Math.round(rect.height);
+      if(label.textContent!==text) label.textContent=text;
+      label.style.bottom=top<30 ? 'auto' : 'calc(100% + 5px)';
+      label.style.top=top<30 ? 'calc(100% + 5px)' : 'auto';
+      label.style.maxWidth=Math.max(30,innerWidth-left-6)+'px';
+    }
+  }
+  function paintOverlays() {
+    overlayFrame=0;
+    if(inspecting && hoverPoint) {
+      const target=atPoint(hoverPoint.x,hoverPoint.y);
+      hoverElement=target?.localName==='iframe' ? null : target;
+    }
+    if(hoverElement && !hoverElement.isConnected) hoverElement=null;
+    if(selectedElement && !selectedElement.isConnected) selectedElement=null;
+    if(feedbackElement && !feedbackElement.isConnected) feedbackElement=null;
+    drawOverlay('selected',selectedElement);
+    drawOverlay('hover',inspecting && hoverElement!==selectedElement ? hoverElement : null);
+    drawOverlay('feedback',feedbackElement);
+    if(hoverPoint || selectedElement || feedbackElement) overlayFrame=requestAnimationFrame(paintOverlays);
+  }
+  function refreshOverlays() { if(!overlayFrame) paintOverlays(); }
+  function feedback(ref,phase) {
+    if(phase===null && feedbackPhase==='applied') return;
+    if(phase===null && ref && feedbackElement!==elements.get(ref)) return;
+    clearTimeout(feedbackTimer);
+    feedbackElement=phase && ref ? resolve(ref) : null;feedbackPhase=phase;
+    if(feedbackElement) {
+      const box=overlayBox('feedback');box.className='box feedback'+(phase==='applied' ? ' applied' : '');
+      for(const player of box.getAnimations({subtree:true})) {player.currentTime=0;player.play();}
+      if(phase==='applied') feedbackTimer=setTimeout(()=>{feedbackElement=null;feedbackPhase=null;refreshOverlays();},560);
+    }
+    refreshOverlays();
+  }
+  document.addEventListener('mousemove',event=>{
+    if(!inspecting) return;
+    if(!hoverPoint) send({kind:'hover-frame'});
+    hoverPoint={x:event.clientX,y:event.clientY};refreshOverlays();
+  },true);
+  document.addEventListener('mouseout',event=>{
+    if(!event.relatedTarget || event.relatedTarget?.localName==='iframe') {hoverPoint=null;hoverElement=null;refreshOverlays();}
+  },true);
+  window.addEventListener('pagehide',()=>globalThis.__workbenchPage?.clearOverlays());
   function send(payload) {
     try { globalThis.__workbenchEvent(JSON.stringify({...payload,docId,source})); } catch {}
   }
@@ -311,7 +386,7 @@ export const browserPageSource = String.raw`(() => {
   document.addEventListener('click', event=> {
     if (!event.isTrusted && source!=='agent') return;
     const target=describe(eventTarget(event));
-    if (target) send({kind:'click',target});
+    if (target) {send({kind:'click',target});if(source==='agent') feedback(target.ref,'applied');}
   },true);
   document.addEventListener('input', event=> {
     if (!event.isTrusted && source!=='agent') return;
@@ -319,6 +394,7 @@ export const browserPageSource = String.raw`(() => {
     if (!el) return;
     const target=describe(el);
     send({kind:el.tagName==='SELECT' ? 'select' : 'fill',target,value:target.value || ''});
+    if(source==='agent') feedback(target.ref,'applied');
   },true);
   document.addEventListener('change', event=> {
     const el=eventTarget(event);
@@ -336,6 +412,13 @@ export const browserPageSource = String.raw`(() => {
   globalThis.__workbenchPage = {
     docId,
     setSource(value) { source=value==='agent' ? 'agent' : 'human'; },
+    setInspect(value) { inspecting=!!value;hoverPoint=null;hoverElement=null;refreshOverlays(); },
+    leave() { hoverPoint=null;hoverElement=null;refreshOverlays(); },
+    feedback,
+    clearOverlays() {
+      inspecting=false;hoverPoint=null;hoverElement=null;selectedElement=null;feedbackElement=null;feedbackPhase=null;clearTimeout(feedbackTimer);
+      cancelAnimationFrame(overlayFrame);overlayFrame=0;overlayHost?.remove();
+    },
     snapshot() {
       const {found,truncated}=scan();
       const candidates=found.filter(el=>visible(el) && !['HTML','HEAD','BODY','SCRIPT','STYLE','META','LINK','NOSCRIPT','TEMPLATE'].includes(el.localName.toUpperCase()));
@@ -401,6 +484,7 @@ export const browserPageSource = String.raw`(() => {
       patches.set(editId,{ref:request.ref,el,textNodes,beforeText,created,hasText,afterText:textNodes.map(node=>node.nodeValue),hasStyles:entries.length>0,beforeCssText,afterCssText:el.style.cssText,hasAnimation,beforeAnimation,afterAnimationToken:prepared?.token});
       editOrder.push(editId);
       send({kind:'edit',target:describe(el),editId,value:JSON.stringify({...(hasText ? {text:request.text} : {}),...(entries.length ? {styles} : {}),...(hasAnimation ? {animation} : {})})});
+      feedback(request.ref,'applied');
       return {editId,element:inspect(request.ref)};
     },
     undo(editId) {
@@ -430,6 +514,7 @@ export const browserPageSource = String.raw`(() => {
       patches.delete(id);
       editOrder.splice(editOrder.indexOf(id),1);
       send({kind:'undo',target:describe(el),editId:id,value:JSON.stringify({editId:id})});
+      feedback(patch.ref,'applied');
       return {editId:id,element:inspect(patch.ref)};
     },
     bounds(ref) {
@@ -455,11 +540,7 @@ export const browserPageSource = String.raw`(() => {
       el.value=value; el.dispatchEvent(new Event('input',{bubbles:true,composed:true})); el.dispatchEvent(new Event('change',{bubbles:true,composed:true}));
     },
     outline(ref) {
-      outline?.remove();
-      if (!ref) return;
-      const rect=resolve(ref).getBoundingClientRect(); outline=document.createElement('div'); overlays.add(outline);
-      outline.style.cssText='position:fixed;pointer-events:none;z-index:2147483647;border:2px solid #5f75ed;border-radius:3px;box-sizing:border-box;left:'+rect.x+'px;top:'+rect.y+'px;width:'+rect.width+'px;height:'+rect.height+'px';
-      document.documentElement.appendChild(outline);
+      selectedElement=ref ? resolve(ref) : null;refreshOverlays();
     },
     mask(enabled) {
       maskNodes.forEach(node=>node.remove()); maskNodes=[];

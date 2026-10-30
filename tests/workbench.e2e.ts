@@ -72,6 +72,11 @@ const errors: string[] = [];
 try {
   const page = await application.firstWindow();
   page.on('pageerror', (error) => errors.push(error.message));
+  await application.evaluate(({ BrowserWindow }) => {
+    const window = BrowserWindow.getAllWindows()[0];
+    window.webContents.setBackgroundThrottling(false);
+    window.hide();
+  });
   const snapshot = () => page.evaluate(() => window.workbench.invoke<AppSnapshot>('app:snapshot'));
   const viewportReady = async () =>
     expect
