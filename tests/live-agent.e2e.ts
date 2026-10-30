@@ -14,7 +14,7 @@ import type { AgentEvent, ElementRef, RecordedStep } from '../src/shared/types';
 type Snapshot = { documentId: string; text: string; elements: ElementRef[] };
 const storageDir = await mkdtemp(join(tmpdir(), 'workbench-live-agent-'));
 const runId = randomUUID().slice(0, 8);
-const aiValue = `诺瓦客户-${runId}`;
+const aiValue = `本地客户-${runId}`;
 const humanValue = `手工验收-${runId}`;
 const events: AgentEvent[] = [];
 const humanSteps: RecordedStep[] = [];

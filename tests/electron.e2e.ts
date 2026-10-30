@@ -55,6 +55,13 @@ try {
       { timeout: 15_000 },
     )
     .toContain('今日清单');
+  if (process.env.WORKBENCH_HIDE_TEST_WINDOW === '1') {
+    await application.evaluate(({ BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows()[0];
+      window.webContents.setBackgroundThrottling(false);
+      window.hide();
+    });
+  }
   await expect
     .poll(
       async () =>
@@ -108,12 +115,13 @@ try {
   });
   await page.getByRole('button', { name: '设置', exact: true }).click();
   await expect(page.getByRole('dialog')).toBeVisible();
-  await expect(page.locator('.agent-setting-row').filter({ hasText: 'Codex' })).toContainText(
-    '可使用',
-  );
+  await expect(
+    page.locator('.agent-setting-row').filter({ has: page.getByText('Codex', { exact: true }) }),
+  ).toContainText('可使用');
   await expect(page.locator('.agent-setting-row').filter({ hasText: 'Claude' })).toBeVisible();
   await page.screenshot({ path: path.join(root, 'test-results/agents.png') });
   await page.getByRole('button', { name: '关闭设置' }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
   checks.push('Actual CLI detection and settings dialog');
 
   const snapshot = async () =>
@@ -132,6 +140,20 @@ try {
   const surfaceBounds = await surface.boundingBox();
   if (!surfaceBounds) throw new Error('Missing browser surface');
   const clickElement = async (element: any) => {
+    await expect(page.locator('.frame-loading')).toHaveCount(0);
+    await expect
+      .poll(async () =>
+        page.evaluate(async () => {
+          const s = await window.workbench.invoke<any>('app:snapshot');
+          const b = document.querySelector('.browser-surface')!.getBoundingClientRect();
+          return Math.max(
+            Math.abs(s.browserFrame.width - Math.floor(b.width)),
+            Math.abs(s.browserFrame.height - Math.floor(b.height)),
+          );
+        }),
+      )
+      .toBeLessThanOrEqual(1);
+    element = (await snapshot()).elements.find((item: any) => item.ref === element.ref) ?? element;
     const actualFrame = await page.evaluate(
       async () => (await window.workbench.invoke<any>('app:snapshot')).browserFrame as BrowserFrame,
     );
@@ -143,7 +165,9 @@ try {
     );
   };
   await page.getByRole('button', { name: '录制', exact: true }).click();
+  await expect(page.locator('.recording-strip')).toBeVisible();
   await clickElement(input);
+  await expect(page.getByRole('textbox', { name: '网页键盘输入' })).toBeFocused();
   await page.keyboard.type('Workbench interface check');
   state = await snapshot();
   const add = state.elements.find((item: any) => item.tag === 'button' && item.name === '添加');
@@ -232,10 +256,12 @@ try {
     await page.screenshot({ path: path.join(root, 'docs/screenshots/recording-analysis.png') });
     checks.push('Actual recording-analysis button → Codex understanding; webpage unchanged');
   }
-  await page.getByRole('button', { name: '连接飞书', exact: true }).click();
+  await page.getByRole('button', { name: '设置', exact: true }).click();
+  await page.getByRole('tab', { name: '飞书', exact: true }).click();
   await expect(page.getByRole('button', { name: '创建专用机器人' })).toBeVisible();
   await page.screenshot({ path: path.join(root, 'docs/screenshots/feishu.png') });
   await page.getByRole('button', { name: '关闭设置' }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
   checks.push('Feishu setup surface available; registration not triggered by test');
   expect(errors).toEqual([]);
   console.log(JSON.stringify({ ok: true, checks, pageErrors: errors }, null, 2));

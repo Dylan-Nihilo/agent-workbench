@@ -7,6 +7,12 @@ import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import type {
   BrowserFrame,
+  BrowserTab,
+  ElementDetails,
+  ElementQuery,
+  ElementQueryResult,
+  ElementEdit,
+  ElementEditResult,
   BrowserInput,
   BrowserState,
   BrowserTool,
@@ -17,6 +23,7 @@ import type {
 } from '../shared/types';
 import { CdpConnection } from './browser-cdp';
 import { browserPageSource } from './browser-page';
+import { BrowserFrameSession, type BrowserChannel } from './browser-frame-session';
 
 const execFileAsync = promisify(execFile);
 const WORLD = 'workbench-browser-observer';
@@ -37,12 +44,42 @@ export function normalizeBrowserUrl(input: string): string {
   return url.href;
 }
 
-export function redactBrowserText(value: unknown): string {
+export function redactBrowserText(value: unknown, limit = 2000): string {
   return String(value ?? '')
     .replace(/Bearer\s+\S+/gi, 'Bearer [hidden]')
     .replace(/(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]+/g, '[hidden]')
     .replace(/((?:password|secret|token|api[_-]?key)\s*[:=]\s*)[^\s,;]+/gi, '$1[hidden]')
-    .slice(0, 2000);
+    .slice(0, limit);
+}
+
+function recordedEditValue(value: string): string {
+  try {
+    const input = JSON.parse(value);
+    if (!input || typeof input !== 'object' || Array.isArray(input))
+      throw new Error('Invalid edit');
+    const output: Record<string, unknown> = {};
+    let truncated = false;
+    if (typeof input.text === 'string') {
+      output.text = redactBrowserText(input.text, 20_000);
+      truncated ||= input.text.length > 20_000;
+    }
+    if (input.styles && typeof input.styles === 'object' && !Array.isArray(input.styles)) {
+      const entries = Object.entries(input.styles);
+      output.styles = Object.fromEntries(
+        entries.slice(0, 30).map(([key, item]) => {
+          const text = typeof item === 'string' ? item : '[invalid style]';
+          truncated ||= key.length > 100 || text.length > 500;
+          return [redactBrowserText(key, 100), redactBrowserText(text, 500)];
+        }),
+      );
+      truncated ||= entries.length > 30;
+    }
+    if (typeof input.editId === 'string') output.editId = redactBrowserText(input.editId, 1500);
+    if (truncated) output.truncated = true;
+    return JSON.stringify(output);
+  } catch {
+    return JSON.stringify({ unavailable: true, reason: 'Invalid edit payload' });
+  }
 }
 
 function evidenceUrl(value: string): string {
@@ -110,11 +147,57 @@ interface BrowserOptions {
   onHumanTakeover: () => void;
 }
 
-/** Owns one real BrowserOS neo page. Electron only displays its interactive frame stream. */
+interface FrameContext {
+  id: string;
+  parentId?: string;
+  url: string;
+  channel: BrowserChannel;
+  revision: number;
+  contextId?: number;
+  documentId?: string;
+  source?: 'human' | 'agent';
+}
+interface TabSession {
+  info: BrowserTab;
+  page: CdpConnection;
+  mainFrameId: string;
+  frames: Map<string, FrameContext>;
+  channels: Set<BrowserChannel>;
+  children: Set<BrowserFrameSession>;
+  pendingFrames: Set<Promise<void>>;
+  activation: number;
+  source: 'human' | 'agent';
+  diagnostics: Array<{ time: number; kind: string; text: string }>;
+  edits: Array<{
+    id: string;
+    frameId: string;
+    documentId: string;
+    localId: string;
+    localRef?: string;
+    changes?: ElementEdit;
+  }>;
+}
+interface ScopedElement {
+  tabId: string;
+  activation: number;
+  frameId: string;
+  revision: number;
+  documentId: string;
+  localRef: string;
+}
+interface FrameGeometry {
+  x: number;
+  y: number;
+  scaleX: number;
+  scaleY: number;
+}
+
+/** One BrowserHost owns all neo targets and grants input only to the visible tab. */
 export class BrowserRuntime {
   private state: BrowserState = {
     status: 'missing',
     engine: 'browseros',
+    tabs: [],
     url: '',
     title: '',
     loading: false,
@@ -125,11 +208,11 @@ export class BrowserRuntime {
   };
   private process?: ChildProcess;
   private browser?: CdpConnection;
-  private page?: CdpConnection;
-  private targetId = '';
-  private mainFrameId = '';
-  private contextId?: number;
-  private documentId = '';
+  private endpoint = '';
+  private tabs = new Map<string, TabSession>();
+  private attaching = new Map<string, Promise<TabSession>>();
+  private activeTabId = '';
+  private refs = new Map<string, ScopedElement>();
   private width = 1100;
   private height = 760;
   private frameAckTimer?: ReturnType<typeof setTimeout>;
@@ -139,30 +222,73 @@ export class BrowserRuntime {
   private leaseGeneration = 0;
   private agentAllowed = true;
   private suppressMouseUp = false;
-  private source: 'human' | 'agent' = 'human';
   private recording?: Recording;
-  private diagnostics: Array<{ time: number; kind: string; text: string }> = [];
 
   constructor(private options: BrowserOptions) {}
 
-  getState(): BrowserState {
-    return structuredClone(this.state);
+  listTabs(): BrowserTab[] {
+    return [...this.tabs.values()].map((tab) => ({ ...tab.info }));
   }
-
-  private update(patch: Partial<BrowserState>): void {
+  getState(): BrowserState {
+    const tab = this.tabs.get(this.activeTabId);
+    return structuredClone({
+      ...this.state,
+      ...(tab?.info ?? {}),
+      tabs: this.listTabs(),
+      activeTabId: tab?.info.id,
+      previewEdits:
+        tab?.edits.flatMap((edit) => {
+          const frame = tab.frames.get(edit.frameId);
+          return edit.localRef && edit.changes && frame?.documentId === edit.documentId
+            ? [
+                {
+                  editId: edit.id,
+                  tabId: tab.info.id,
+                  frameId: edit.frameId,
+                  documentId: edit.documentId,
+                  nodeId: edit.localRef,
+                  changes: edit.changes,
+                },
+              ]
+            : [];
+        }) ?? [],
+    });
+  }
+  private update(patch: Partial<BrowserState> = {}): void {
     this.state = { ...this.state, ...patch };
     this.options.onState(this.getState());
   }
-
-  private log(kind: string, text: unknown): void {
-    this.diagnostics.push({ time: Date.now(), kind, text: redactBrowserText(text) });
-    if (this.diagnostics.length > 150) this.diagnostics.shift();
+  private updateTab(tab: TabSession, patch: Partial<BrowserTab>): void {
+    if (this.tabs.get(tab.info.id) !== tab) return;
+    Object.assign(tab.info, patch);
+    this.update();
   }
-
+  private log(tab: TabSession | undefined, kind: string, text: unknown): void {
+    if (!tab) return;
+    tab.diagnostics.push({ time: Date.now(), kind, text: redactBrowserText(text) });
+    if (tab.diagnostics.length > 150) tab.diagnostics.shift();
+  }
   private serialize<T>(action: () => Promise<T>): Promise<T> {
     const result = this.queue.then(action);
     this.queue = result.catch(() => {});
     return result;
+  }
+  private activeTab(): TabSession {
+    const tab = this.tabs.get(this.activeTabId);
+    if (!tab || this.state.status !== 'ready') throw new Error('BrowserOS neo 尚未就绪');
+    return tab;
+  }
+  private async until<T>(
+    check: () => Promise<T | undefined | false>,
+    timeout = 10_000,
+  ): Promise<T> {
+    const end = Date.now() + timeout;
+    while (Date.now() < end) {
+      const value = await check();
+      if (value) return value as T;
+      await wait(50);
+    }
+    throw new Error('等待浏览器响应超时');
   }
 
   start(initialUrl?: string): Promise<void> {
@@ -173,7 +299,6 @@ export class BrowserRuntime {
     });
     return this.starting;
   }
-
   private async startInternal(initialUrl?: string): Promise<void> {
     const initial = initialUrl === undefined ? undefined : normalizeBrowserUrl(initialUrl);
     this.disposed = false;
@@ -181,7 +306,7 @@ export class BrowserRuntime {
     if (!binary) {
       this.update({
         status: 'missing',
-        error: '未找到 BrowserOS neo。请安装官方 neo，或在设置中指定其应用路径。',
+        error: '未找到 BrowserOS neo。请安装官方 neo，或指定其应用路径。',
       });
       throw new Error(this.state.error);
     }
@@ -222,284 +347,459 @@ export class BrowserRuntime {
       },
     );
     this.process = child;
-    let launchError: Error | undefined;
-    let endpointFromOutput = '';
+    let failure: Error | undefined;
+    let endpoint = '';
     child.stderr?.on('data', (data) => {
       const match = data
         .toString()
         .match(/DevTools listening on (ws:\/\/127\.0\.0\.1:\d+\/devtools\/browser\/[^\s]+)/);
-      if (match) endpointFromOutput = match[1];
+      if (match) endpoint = match[1];
     });
     child.on('error', (error) => {
-      launchError = error;
+      failure = error;
     });
     child.on('exit', () => {
       if (!this.disposed && this.process === child)
         this.update({
           status: 'error',
           loading: false,
-          error: 'BrowserOS neo 已退出。请重新启动浏览器。',
+          error: 'BrowserOS neo 已退出，请重新启动。',
         });
     });
     try {
-      const endpoint = await this.until(async () => {
-        if (launchError) throw launchError;
+      this.endpoint = await this.until(async () => {
+        if (failure) throw failure;
         if (child.exitCode !== null) throw new Error('BrowserOS neo 启动失败');
-        return endpointFromOutput || undefined;
+        return endpoint || undefined;
       }, 20_000);
-      this.browser = await CdpConnection.connect(endpoint);
-      const url = new URL(endpoint);
-      const response = await fetch(`http://${url.host}/json/list`);
-      const targets = (await response.json()) as Array<{
-        id: string;
-        type: string;
-        webSocketDebuggerUrl: string;
-      }>;
-      const target = targets.find((item) => item.type === 'page');
-      if (!target) throw new Error('BrowserOS neo 没有创建可用页面');
-      this.targetId = target.id;
-      this.page = await CdpConnection.connect(target.webSocketDebuggerUrl);
-      this.installPageEvents();
-      await this.page.call('Page.enable');
-      const tree = await this.page.call('Page.getFrameTree');
-      this.mainFrameId = tree.frameTree.frame.id;
-      await this.page.call('Runtime.enable');
-      await this.page.call('Network.enable');
-      await this.page.call('Runtime.addBinding', {
-        name: '__workbenchEvent',
-        executionContextName: WORLD,
+      this.browser = await CdpConnection.connect(this.endpoint);
+      this.browser.on('Target.targetCreated', (p) => {
+        void this.handleTarget(p.targetInfo);
       });
-      await this.page.call('Page.addScriptToEvaluateOnNewDocument', {
-        source: browserPageSource,
-        worldName: WORLD,
+      this.browser.on('Target.targetInfoChanged', (p) => {
+        void this.handleTarget(p.targetInfo);
       });
-      const world = await this.page.call('Page.createIsolatedWorld', {
-        frameId: this.mainFrameId,
-        worldName: WORLD,
+      this.browser.on('Target.targetDestroyed', (p) => {
+        void this.removeTarget(p.targetId);
       });
-      this.contextId = world.executionContextId;
-      await this.page.call('Runtime.evaluate', {
-        expression: browserPageSource,
-        contextId: this.contextId,
+      const { targetInfos } = await this.browser.call('Target.getTargets');
+      const first = targetInfos.find((item: any) => item.type === 'page');
+      if (!first) throw new Error('BrowserOS neo 没有创建可用页面');
+      const tab = await this.attachTab(first);
+      await this.activateTab(tab, 'human', false);
+      await this.browser.call('Target.setDiscoverTargets', { discover: true });
+      if (initial !== undefined) {
+        this.updateTab(tab, { url: initial, loading: true });
+        const result = await tab.page.call('Page.navigate', { url: initial });
+        if (result.errorText) throw new Error(result.errorText);
+        await this.refreshTab(tab);
+      }
+      this.update({ status: 'ready', error: undefined });
+    } catch (error) {
+      const message = redactBrowserText(error instanceof Error ? error.message : error);
+      await this.dispose();
+      this.update({ status: 'error', loading: false, error: message });
+      throw new Error(message);
+    }
+  }
+
+  private async handleTarget(info: any): Promise<void> {
+    if (this.disposed || info.type !== 'page') return;
+    const existing = this.tabs.get(info.targetId);
+    if (existing) {
+      this.updateTab(existing, {
+        title: info.title || existing.info.title,
+        url: info.url || existing.info.url,
       });
-      await this.page.call('Emulation.setDeviceMetricsOverride', {
+      return;
+    }
+    try {
+      await this.attachTab(info);
+    } catch (error) {
+      this.log(
+        this.tabs.get(this.activeTabId),
+        'tab.error',
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }
+  private attachTab(info: any): Promise<TabSession> {
+    const pending = this.attaching.get(info.targetId);
+    if (pending) return pending;
+    const existing = this.tabs.get(info.targetId);
+    if (existing) return Promise.resolve(existing);
+    const task = this.attachTabInternal(info).finally(() => this.attaching.delete(info.targetId));
+    this.attaching.set(info.targetId, task);
+    return task;
+  }
+  private async attachTabInternal(info: any): Promise<TabSession> {
+    const host = new URL(this.endpoint).host;
+    const target = await this.until(async () => {
+      const all = (await (await fetch(`http://${host}/json/list`)).json()) as any[];
+      return all.find((item) => item.id === info.targetId && item.webSocketDebuggerUrl);
+    });
+    const page = await CdpConnection.connect(target.webSocketDebuggerUrl);
+    const tab: TabSession = {
+      info: {
+        id: info.targetId,
+        title: info.title || '新标签页',
+        url: info.url || 'about:blank',
+        loading: false,
+        canGoBack: false,
+        canGoForward: false,
+      },
+      page,
+      mainFrameId: '',
+      frames: new Map(),
+      channels: new Set(),
+      children: new Set(),
+      pendingFrames: new Set(),
+      activation: 0,
+      source: 'human',
+      diagnostics: [],
+      edits: [],
+    };
+    this.tabs.set(tab.info.id, tab);
+    try {
+      await this.installChannel(tab, page, true);
+      page.on('Page.screencastFrame', (p) => {
+        if (this.disposed || this.activeTabId !== tab.info.id) {
+          void page.call('Page.screencastFrameAck', { sessionId: p.sessionId }).catch(() => {});
+          return;
+        }
+        this.options.onFrame({
+          data: `data:image/jpeg;base64,${p.data}`,
+          width: p.metadata.deviceWidth || this.width,
+          height: p.metadata.deviceHeight || this.height,
+          tabId: tab.info.id,
+        });
+        this.frameAckTimer = setTimeout(() => {
+          this.frameAckTimer = undefined;
+          void page.call('Page.screencastFrameAck', { sessionId: p.sessionId }).catch(() => {});
+        }, PREVIEW_INTERVAL);
+      });
+      page.on('connection:closed', () => {
+        if (!this.disposed && this.tabs.get(tab.info.id) === tab)
+          void this.removeTarget(tab.info.id);
+      });
+      await page.call('Emulation.setDeviceMetricsOverride', {
         width: this.width,
         height: this.height,
         deviceScaleFactor: 2,
         mobile: false,
       });
-      await this.page.call('Page.bringToFront');
-      await this.startScreencast();
-      await this.page.call('Fetch.enable', {
-        patterns: [{ resourceType: 'Document', requestStage: 'Request' }],
-      });
-      this.browser.on('Target.targetCreated', (params) => {
-        void this.handlePopup(params.targetInfo);
-      });
-      this.browser.on('Target.targetInfoChanged', (params) => {
-        void this.handlePopup(params.targetInfo);
-      });
-      await this.browser.call('Target.setDiscoverTargets', { discover: true });
-      if (initial !== undefined) {
-        // Startup is not a user action. Finish it before exposing a ready browser.
-        this.update({ url: initial, loading: true });
-        const navigation = await this.page.call('Page.navigate', { url: initial });
-        if (navigation.errorText) throw new Error(navigation.errorText);
-        await this.refreshPageState();
-        this.update({ status: 'ready', error: undefined });
-        return;
-      }
-      this.update({
-        status: 'ready',
-        loading: false,
-        url: 'about:blank',
-        title: '新标签页',
-        error: undefined,
-      });
+      await this.refreshTab(tab);
+      this.update();
+      return tab;
     } catch (error) {
-      const message = redactBrowserText(error instanceof Error ? error.message : error);
-      await this.dispose();
-      this.update({ status: 'error', error: message, loading: false });
-      throw new Error(message);
+      this.tabs.delete(tab.info.id);
+      page.close();
+      throw error;
     }
   }
-
-  private async until<T>(
-    check: () => Promise<T | undefined | false>,
-    timeout = 10_000,
-  ): Promise<T> {
-    const end = Date.now() + timeout;
-    while (Date.now() < end) {
-      const value = await check();
-      if (value) return value as T;
-      await wait(60);
+  private registerFrame(
+    tab: TabSession,
+    frame: any,
+    channel: BrowserChannel,
+    parentId?: string,
+  ): FrameContext {
+    let entry = tab.frames.get(frame.id);
+    if (!entry) {
+      entry = {
+        id: frame.id,
+        parentId: frame.parentId || parentId,
+        url: frame.url || '',
+        channel,
+        revision: 0,
+      };
+      tab.frames.set(frame.id, entry);
+    } else {
+      entry.url = frame.url || entry.url;
+      if (frame.parentId || parentId) entry.parentId = frame.parentId || parentId;
+      if (channel !== tab.page || !tab.children.has(entry.channel as BrowserFrameSession))
+        entry.channel = channel;
     }
-    throw new Error('等待浏览器响应超时');
+    return entry;
   }
-
-  private installPageEvents(): void {
-    const page = this.page!;
-    page.on('Runtime.executionContextCreated', (params) => {
-      const ctx = params.context;
-      if (ctx.name === WORLD && ctx.auxData?.frameId === this.mainFrameId) this.contextId = ctx.id;
+  private invalidateFrame(tab: TabSession, frame: FrameContext): void {
+    frame.revision++;
+    frame.contextId = undefined;
+    frame.documentId = undefined;
+    frame.source = undefined;
+    for (const [ref, scope] of this.refs)
+      if (scope.tabId === tab.info.id && scope.frameId === frame.id) this.refs.delete(ref);
+    const editCount = tab.edits.length;
+    tab.edits = tab.edits.filter((edit) => edit.frameId !== frame.id);
+    if (this.activeTabId === tab.info.id && this.state.selectedElement?.frameId === frame.id)
+      this.update({ selectedElement: undefined, inspecting: false });
+    else if (this.activeTabId === tab.info.id && tab.edits.length !== editCount) this.update();
+  }
+  private async installChannel(
+    tab: TabSession,
+    channel: BrowserChannel,
+    root = false,
+  ): Promise<void> {
+    if (tab.channels.has(channel)) return;
+    tab.channels.add(channel);
+    const contexts = new Map<number, string>();
+    const children = new Map<string, BrowserFrameSession>();
+    channel.on('Runtime.executionContextCreated', (p) => {
+      const c = p.context;
+      if (c.name === WORLD && c.auxData?.frameId) {
+        contexts.set(c.id, c.auxData.frameId);
+        const f = tab.frames.get(c.auxData.frameId);
+        if (f) f.contextId = c.id;
+      }
     });
-    page.on('Runtime.executionContextDestroyed', (params) => {
-      if (params.executionContextId === this.contextId) this.contextId = undefined;
-    });
-    page.on('Runtime.executionContextsCleared', () => {
-      this.contextId = undefined;
-    });
-    page.on('Runtime.bindingCalled', (params) => {
+    channel.on('Runtime.executionContextDestroyed', (p) => contexts.delete(p.executionContextId));
+    channel.on('Runtime.executionContextsCleared', () => contexts.clear());
+    channel.on('Runtime.bindingCalled', (p) => {
       if (
-        params.name !== '__workbenchEvent' ||
-        params.executionContextId !== this.contextId ||
-        typeof params.payload !== 'string' ||
-        params.payload.length > 16_000
+        this.disposed ||
+        this.tabs.get(tab.info.id) !== tab ||
+        p.name !== '__workbenchEvent' ||
+        typeof p.payload !== 'string' ||
+        p.payload.length > 256_000
       )
         return;
+      const frameId =
+        contexts.get(p.executionContextId) ||
+        [...tab.frames.values()].find(
+          (f) => f.channel === channel && f.contextId === p.executionContextId,
+        )?.id;
+      const frame = frameId && tab.frames.get(frameId);
+      if (!frame) return;
       try {
-        this.recordEvent(JSON.parse(params.payload));
+        this.recordEvent(tab, frame, JSON.parse(p.payload));
       } catch {}
     });
-    page.on('Page.frameNavigated', (params) => {
-      if (params.frame.parentId) return;
-      this.mainFrameId = params.frame.id;
-      this.documentId = '';
-      this.contextId = undefined;
-      this.update({ url: params.frame.url, selectedElement: undefined });
+    channel.on('Page.frameNavigated', (p) => {
+      const frame = this.registerFrame(tab, p.frame, channel);
+      this.invalidateFrame(tab, frame);
+      if (root && !p.frame.parentId) {
+        tab.mainFrameId = frame.id;
+        tab.activation++;
+        tab.edits = [];
+        this.clearTabRefs(tab);
+        if (this.activeTabId === tab.info.id)
+          this.update({ selectedElement: undefined, inspecting: false });
+        this.updateTab(tab, { url: frame.url });
+      }
       this.appendStep({
         kind: 'navigate',
-        description: `打开 ${evidenceUrl(params.frame.url)}`,
-        url: evidenceUrl(params.frame.url),
-        source: this.source,
+        description: `打开 ${evidenceUrl(frame.url)}`,
+        url: evidenceUrl(frame.url),
+        source: tab.source,
+        tabId: tab.info.id,
+        frameId: frame.id,
       });
-      void this.refreshPageState();
+      if (root && !p.frame.parentId) void this.refreshTab(tab);
     });
-    page.on('Page.navigatedWithinDocument', (params) => {
-      if (params.frameId === this.mainFrameId) {
-        this.update({ url: params.url });
-        void this.refreshPageState();
+    channel.on('Page.frameDetached', (p) => {
+      if (p.reason === 'swap') return;
+      const frame = tab.frames.get(p.frameId);
+      if (frame) {
+        this.invalidateFrame(tab, frame);
+        tab.frames.delete(frame.id);
       }
     });
-    page.on('Page.frameStartedLoading', (params) => {
-      if (params.frameId === this.mainFrameId) this.update({ loading: true });
-    });
-    page.on('Page.frameStoppedLoading', (params) => {
-      if (params.frameId === this.mainFrameId) {
-        this.update({ loading: false });
-        void this.refreshPageState();
+    channel.on('Page.navigatedWithinDocument', (p) => {
+      const frame = tab.frames.get(p.frameId);
+      if (frame) frame.url = p.url;
+      if (p.frameId === tab.mainFrameId) {
+        this.updateTab(tab, { url: p.url });
+        void this.refreshTab(tab);
       }
     });
-    page.on('Page.screencastFrame', (params) => {
-      if (this.disposed || this.page !== page) return;
-      // Metadata dimensions are CSS/DIP coordinates, not the JPEG's physical pixels.
-      this.options.onFrame({
-        data: `data:image/jpeg;base64,${params.data}`,
-        width: params.metadata.deviceWidth || this.width,
-        height: params.metadata.deviceHeight || this.height,
-      });
-      // One in-flight frame provides backpressure; retain the final dirty frame without polling.
-      this.frameAckTimer = setTimeout(() => {
-        this.frameAckTimer = undefined;
-        void page.call('Page.screencastFrameAck', { sessionId: params.sessionId }).catch(() => {});
-      }, PREVIEW_INTERVAL);
+    channel.on('Page.frameStartedLoading', (p) => {
+      if (p.frameId === tab.mainFrameId) this.updateTab(tab, { loading: true });
     });
-    page.on('Runtime.consoleAPICalled', (params) =>
+    channel.on('Page.frameStoppedLoading', (p) => {
+      if (p.frameId === tab.mainFrameId) {
+        this.updateTab(tab, { loading: false });
+        void this.refreshTab(tab);
+      }
+    });
+    channel.on('Runtime.consoleAPICalled', (p) =>
       this.log(
-        `console.${params.type}`,
-        params.args.map((arg: any) => arg.value ?? arg.description ?? '').join(' '),
+        tab,
+        `console.${p.type}`,
+        p.args.map((arg: any) => arg.value ?? arg.description ?? '').join(' '),
       ),
     );
-    page.on('Runtime.exceptionThrown', (params) =>
+    channel.on('Runtime.exceptionThrown', (p) =>
       this.log(
+        tab,
         'exception',
-        params.exceptionDetails.exception?.description || params.exceptionDetails.text,
+        p.exceptionDetails.exception?.description || p.exceptionDetails.text,
       ),
     );
-    page.on('Network.responseReceived', (params) =>
-      this.log('network', `${params.response.status} ${evidenceUrl(params.response.url)}`),
+    channel.on('Network.responseReceived', (p) =>
+      this.log(tab, 'network', `${p.response.status} ${evidenceUrl(p.response.url)}`),
     );
-    page.on('Network.loadingFailed', (params) => this.log('network.error', params.errorText));
-    page.on('Page.javascriptDialogOpening', () => {
-      this.log('dialog', '页面弹窗已关闭；请在普通页面控件中完成交互。');
-      void page.call('Page.handleJavaScriptDialog', { accept: false }).catch(() => {});
+    channel.on('Network.loadingFailed', (p) => this.log(tab, 'network.error', p.errorText));
+    channel.on('Page.javascriptDialogOpening', () => {
+      this.log(tab, 'dialog', '页面弹窗已关闭；请在页面控件中完成交互。');
+      void channel.call('Page.handleJavaScriptDialog', { accept: false }).catch(() => {});
     });
-    page.on('Fetch.requestPaused', (params) => {
-      let allowed = params.request.url === 'about:blank';
+    channel.on('Fetch.requestPaused', (p) => {
+      let allowed = p.request.url === 'about:blank';
       try {
-        normalizeBrowserUrl(params.request.url);
+        normalizeBrowserUrl(p.request.url);
         allowed = true;
       } catch {}
-      void page
+      void channel
         .call(
           allowed ? 'Fetch.continueRequest' : 'Fetch.failRequest',
           allowed
-            ? { requestId: params.requestId }
-            : { requestId: params.requestId, errorReason: 'BlockedByClient' },
+            ? { requestId: p.requestId }
+            : { requestId: p.requestId, errorReason: 'BlockedByClient' },
         )
         .catch(() => {});
-      if (!allowed) this.log('navigation.blocked', '阻止了非 HTTP(S) 页面导航');
+      if (!allowed) this.log(tab, 'navigation.blocked', '阻止了非 HTTP(S) 页面导航');
     });
-    page.on('connection:closed', () => {
-      if (!this.disposed && this.page === page)
-        this.update({ status: 'error', loading: false, error: 'BrowserOS neo 连接已断开' });
+    channel.on('Target.receivedMessageFromTarget', (p) =>
+      children.get(p.sessionId)?.receive(p.message),
+    );
+    channel.on('Target.detachedFromTarget', (p) => {
+      const child = children.get(p.sessionId);
+      if (!child) return;
+      child.close();
+      children.delete(p.sessionId);
+      tab.children.delete(child);
+      tab.channels.delete(child);
+      for (const frame of tab.frames.values())
+        if (frame.channel === child) {
+          this.invalidateFrame(tab, frame);
+          tab.frames.delete(frame.id);
+        }
     });
+    channel.on('Target.attachedToTarget', (p) => {
+      if (p.targetInfo.type !== 'iframe') {
+        void channel.call('Target.detachFromTarget', { sessionId: p.sessionId }).catch(() => {});
+        return;
+      }
+      const child = new BrowserFrameSession(channel, p.sessionId);
+      children.set(p.sessionId, child);
+      tab.children.add(child);
+      const setup = this.installChannel(tab, child)
+        .catch((error) =>
+          this.log(tab, 'frame.error', error instanceof Error ? error.message : error),
+        )
+        .finally(() => tab.pendingFrames.delete(setup));
+      tab.pendingFrames.add(setup);
+    });
+    await channel.call('Page.enable');
+    await channel.call('DOM.enable');
+    const tree = await channel.call('Page.getFrameTree');
+    const walk = (node: any, parentId?: string) => {
+      this.registerFrame(tab, node.frame, channel, parentId);
+      for (const child of node.childFrames || []) walk(child, node.frame.id);
+    };
+    walk(tree.frameTree);
+    if (root) tab.mainFrameId = tree.frameTree.frame.id;
+    await channel.call('Runtime.enable');
+    await channel.call('Network.enable');
+    await channel.call('Runtime.addBinding', {
+      name: '__workbenchEvent',
+      executionContextName: WORLD,
+    });
+    await channel.call('Page.addScriptToEvaluateOnNewDocument', {
+      source: browserPageSource,
+      worldName: WORLD,
+    });
+    await channel.call('Fetch.enable', {
+      patterns: [{ resourceType: 'Document', requestStage: 'Request' }],
+    });
+    await channel.call('Target.setAutoAttach', {
+      autoAttach: true,
+      waitForDebuggerOnStart: false,
+      flatten: false,
+      filter: [{ type: 'iframe', exclude: false }, { exclude: true }],
+    });
+    for (const frame of tab.frames.values())
+      if (frame.channel === channel) await this.prepareFrame(tab, frame).catch(() => {});
   }
-
-  private async handlePopup(info: { targetId: string; type: string; url: string }): Promise<void> {
-    if (
-      this.disposed ||
-      info.type !== 'page' ||
-      info.targetId === this.targetId ||
-      !info.url ||
-      info.url === 'about:blank'
-    )
-      return;
-    try {
-      const url = normalizeBrowserUrl(info.url);
-      await this.browser?.call('Target.closeTarget', { targetId: info.targetId });
-      await this.serialize(() => this.navigateInternal(url, this.source));
-    } catch {
-      await this.browser?.call('Target.closeTarget', { targetId: info.targetId }).catch(() => {});
-    }
+  private async collectFrames(tab: TabSession): Promise<FrameContext[]> {
+    if (tab.pendingFrames.size) await Promise.allSettled([...tab.pendingFrames]);
+    const tree = await tab.page.call('Page.getFrameTree');
+    const present = new Set<string>();
+    const walk = (node: any, parentId?: string) => {
+      present.add(node.frame.id);
+      this.registerFrame(tab, node.frame, tab.page, parentId);
+      for (const child of node.childFrames || []) walk(child, node.frame.id);
+    };
+    walk(tree.frameTree);
+    tab.mainFrameId = tree.frameTree.frame.id;
+    // OOPIF children may be reported only by their own target's frame tree.
+    return [...tab.frames.values()].filter(
+      (frame) => present.has(frame.id) || frame.channel !== tab.page,
+    );
   }
-
-  private async refreshPageState(): Promise<void> {
-    try {
-      const result = await this.page?.call('Runtime.evaluate', {
-        expression: '({title:document.title,url:location.href})',
-        returnByValue: true,
-      });
-      const history = await this.page?.call('Page.getNavigationHistory');
-      if (result?.result.value)
-        this.update({
-          title: result.result.value.title,
-          url: result.result.value.url,
-          canGoBack: history.currentIndex > 0,
-          canGoForward: history.currentIndex < history.entries.length - 1,
+  private async prepareFrame(tab: TabSession, frame: FrameContext): Promise<number> {
+    if (this.disposed || this.tabs.get(tab.info.id) !== tab) throw new Error('页面已关闭');
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const world = await frame.channel.call('Page.createIsolatedWorld', {
+          frameId: frame.id,
+          worldName: WORLD,
         });
-    } catch {}
+        const contextId = world.executionContextId as number;
+        const ready = await frame.channel.call('Runtime.evaluate', {
+          expression:
+            '({ready:typeof globalThis.__workbenchPage === "object" && typeof globalThis.__workbenchEvent === "function",documentId:globalThis.__workbenchPage?.docId})',
+          contextId,
+          returnByValue: true,
+        });
+        if (ready.exceptionDetails) throw new Error(ready.exceptionDetails.text);
+        if (!ready.result.value?.ready) {
+          await frame.channel.call('Runtime.addBinding', {
+            name: '__workbenchEvent',
+            executionContextId: contextId,
+          });
+          const installed = await frame.channel.call('Runtime.evaluate', {
+            expression: browserPageSource,
+            contextId,
+          });
+          if (installed.exceptionDetails)
+            throw new Error(
+              installed.exceptionDetails.exception?.description || installed.exceptionDetails.text,
+            );
+        }
+        const identity = await frame.channel.call('Runtime.evaluate', {
+          expression: 'globalThis.__workbenchPage.docId',
+          contextId,
+          returnByValue: true,
+        });
+        if (frame.documentId && frame.documentId !== identity.result.value)
+          this.invalidateFrame(tab, frame);
+        frame.documentId = identity.result.value;
+        frame.contextId = contextId;
+        return contextId;
+      } catch (error) {
+        frame.contextId = undefined;
+        const message = error instanceof Error ? error.message : String(error);
+        if (
+          attempt === 2 ||
+          !/Cannot find (?:context|execution context)|Execution context was destroyed|No frame with given id|No frame for given id/i.test(
+            message,
+          )
+        )
+          throw error;
+        await wait(25);
+      }
+    }
+    throw new Error('无法连接页面框架');
   }
-
-  private async startScreencast(): Promise<void> {
-    // Native DPR 2 is required: emulation alone leaves the composited screencast at DPR 1.
-    await this.page!.call('Page.startScreencast', {
-      format: 'jpeg',
-      quality: 88,
-      maxWidth: PREVIEW_MAX_EDGE,
-      maxHeight: PREVIEW_MAX_EDGE,
-      everyNthFrame: 1,
-      maxFramesInFlight: 1,
-      sendLastFrame: true,
-    });
-  }
-
-  private async bridge<T = any>(expression: string): Promise<T> {
-    this.requireReady();
-    // BFCache can announce a restored context before frameNavigated clears the cache.
-    // Resolve the named world from the active frame instead of waiting for another event.
-    const contextId = await this.prepareBridgeContext();
-    const result = await this.page!.call('Runtime.evaluate', {
+  private async bridge<T = any>(
+    tab: TabSession,
+    frame: FrameContext,
+    expression: string,
+    guard?: () => void,
+  ): Promise<T> {
+    const contextId = await this.prepareFrame(tab, frame);
+    guard?.();
+    const result = await frame.channel.call('Runtime.evaluate', {
       expression,
       contextId,
       returnByValue: true,
@@ -511,160 +811,453 @@ export class BrowserRuntime {
       );
     return result.result.value as T;
   }
-
-  private async prepareBridgeContext(): Promise<number> {
-    const page = this.page!;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      this.requireReady();
-      try {
-        const tree = await page.call('Page.getFrameTree');
-        const frameId = tree.frameTree.frame.id;
-        const world = await page.call('Page.createIsolatedWorld', {
-          frameId,
-          worldName: WORLD,
+  private mainFrame(tab: TabSession): FrameContext {
+    const frame = tab.frames.get(tab.mainFrameId);
+    if (!frame) throw new Error('页面框架尚未就绪');
+    return frame;
+  }
+  private async refreshTab(tab: TabSession): Promise<void> {
+    try {
+      const result = await tab.page.call('Runtime.evaluate', {
+        expression: '({title:document.title,url:location.href})',
+        returnByValue: true,
+      });
+      const history = await tab.page.call('Page.getNavigationHistory');
+      if (result.result.value)
+        this.updateTab(tab, {
+          title: result.result.value.title,
+          url: result.result.value.url,
+          canGoBack: history.currentIndex > 0,
+          canGoForward: history.currentIndex < history.entries.length - 1,
         });
-        const contextId = world.executionContextId as number;
-        const ready = await page.call('Runtime.evaluate', {
-          expression:
-            'typeof globalThis.__workbenchPage === "object" && typeof globalThis.__workbenchEvent === "function"',
-          contextId,
-          returnByValue: true,
-        });
-        if (ready.exceptionDetails)
-          throw new Error(
-            ready.exceptionDetails.exception?.description || ready.exceptionDetails.text,
-          );
-        if (!ready.result.value) {
-          await page.call('Runtime.addBinding', {
-            name: '__workbenchEvent',
-            executionContextId: contextId,
-          });
-          const installed = await page.call('Runtime.evaluate', {
-            expression: browserPageSource,
-            contextId,
-          });
-          if (installed.exceptionDetails)
-            throw new Error(
-              installed.exceptionDetails.exception?.description || installed.exceptionDetails.text,
-            );
-        }
-        this.mainFrameId = frameId;
-        this.contextId = contextId;
-        return contextId;
-      } catch (error) {
-        this.contextId = undefined;
-        const message = error instanceof Error ? error.message : String(error);
-        if (
-          attempt === 2 ||
-          !/Cannot find (?:context|execution context)|Execution context was destroyed|No frame with given id|No frame for given id/i.test(
-            message,
-          )
-        )
-          throw error;
-        await wait(30);
-      }
+    } catch {}
+  }
+  private async startScreencast(tab: TabSession): Promise<void> {
+    await tab.page.call('Page.startScreencast', {
+      format: 'jpeg',
+      quality: 88,
+      maxWidth: PREVIEW_MAX_EDGE,
+      maxHeight: PREVIEW_MAX_EDGE,
+      everyNthFrame: 1,
+      maxFramesInFlight: 1,
+      sendLastFrame: true,
+    });
+  }
+  private clearTabRefs(tab: TabSession): void {
+    for (const [ref, scope] of this.refs) if (scope.tabId === tab.info.id) this.refs.delete(ref);
+  }
+  private async clearOutline(tab: TabSession): Promise<void> {
+    for (const frame of tab.frames.values())
+      await this.bridge(tab, frame, 'globalThis.__workbenchPage.outline(null)').catch(() => {});
+  }
+  private async activateTab(
+    tab: TabSession,
+    source: 'human' | 'agent',
+    record = true,
+  ): Promise<void> {
+    if (this.activeTabId === tab.info.id) return;
+    const previous = this.tabs.get(this.activeTabId);
+    if (this.frameAckTimer) clearTimeout(this.frameAckTimer);
+    this.frameAckTimer = undefined;
+    if (previous) {
+      await previous.page.call('Page.stopScreencast').catch(() => {});
+      await this.clearOutline(previous);
+      previous.activation++;
+      this.clearTabRefs(previous);
     }
-    throw new Error('无法连接当前页面的隔离上下文');
+    this.activeTabId = tab.info.id;
+    tab.activation++;
+    tab.source = source;
+    this.clearTabRefs(tab);
+    this.suppressMouseUp = false;
+    this.update({ selectedElement: undefined, inspecting: false });
+    this.options.onFrame({ data: '', width: this.width, height: this.height, tabId: tab.info.id });
+    await tab.page.call('Emulation.setDeviceMetricsOverride', {
+      width: this.width,
+      height: this.height,
+      deviceScaleFactor: 2,
+      mobile: false,
+    });
+    await tab.page.call('Page.bringToFront');
+    await this.startScreencast(tab);
+    await this.refreshTab(tab);
+    if (record)
+      this.appendStep({
+        kind: 'navigate',
+        description: `切换页面：${tab.info.title || evidenceUrl(tab.info.url)}`,
+        url: evidenceUrl(tab.info.url),
+        source,
+        tabId: tab.info.id,
+        frameId: tab.mainFrameId,
+      });
   }
-
-  private requireReady(): void {
-    if (!this.page || this.state.status !== 'ready') throw new Error('BrowserOS neo 尚未就绪');
-  }
-
-  private async setSource(source: 'human' | 'agent'): Promise<void> {
-    this.source = source;
-    await this.bridge(`globalThis.__workbenchPage.setSource(${JSON.stringify(source)})`);
-  }
-
   allowAgentControl(): void {
     this.agentAllowed = true;
   }
-
-  private humanTakeover(source: string): void {
+  revokeAgentControl(): void {
     this.leaseGeneration++;
     this.agentAllowed = false;
-    this.log('control', `Human takeover: ${source}`);
+  }
+  private humanTakeover(source: string): void {
+    this.revokeAgentControl();
+    this.log(this.tabs.get(this.activeTabId), 'control', `Human takeover: ${source}`);
     this.options.onHumanTakeover();
   }
-
-  navigate(url: string): Promise<void> {
-    const normalized = normalizeBrowserUrl(url);
-    this.humanTakeover('navigate');
-    return this.serialize(() => this.navigateInternal(normalized, 'human'));
+  newTab(url?: string): Promise<BrowserTab> {
+    const initial = url === undefined ? 'about:blank' : normalizeBrowserUrl(url);
+    this.humanTakeover('new-tab');
+    return this.serialize(() => this.createTab(initial, 'human'));
+  }
+  private async createTab(
+    url: string,
+    source: 'human' | 'agent',
+    guard?: () => void,
+  ): Promise<BrowserTab> {
+    if (!this.browser || this.state.status !== 'ready') throw new Error('浏览器尚未就绪');
+    guard?.();
+    const result = await this.browser.call('Target.createTarget', {
+      url: 'about:blank',
+      newWindow: false,
+    });
+    const tab = await this.attachTab({
+      targetId: result.targetId,
+      type: 'page',
+      url: 'about:blank',
+      title: '新标签页',
+    });
+    guard?.();
+    await this.activateTab(tab, source);
+    if (url !== 'about:blank') await this.navigateInternal(tab, url, source);
+    return { ...tab.info };
+  }
+  switchTab(id: string): Promise<void> {
+    if (!this.tabs.has(id)) return Promise.reject(new Error('标签页不存在'));
+    this.humanTakeover('switch-tab');
+    return this.serialize(async () => {
+      const tab = this.attaching.has(id) ? await this.attaching.get(id) : this.tabs.get(id);
+      if (!tab) throw new Error('标签页已关闭');
+      if (id === this.activeTabId) return;
+      await this.activateTab(tab, 'human');
+    });
+  }
+  closeTab(id: string): Promise<void> {
+    if (!this.tabs.has(id)) return Promise.reject(new Error('标签页不存在'));
+    this.humanTakeover('close-tab');
+    return this.serialize(() => this.closeTabInternal(id, 'human'));
+  }
+  private async closeTabInternal(id: string, source: 'human' | 'agent'): Promise<void> {
+    const tab = this.tabs.get(id);
+    if (!tab) throw new Error('标签页已关闭');
+    if (this.tabs.size === 1) await this.createTab('about:blank', source);
+    else if (this.activeTabId === id)
+      await this.activateTab(
+        [...this.tabs.values()].find((other) => other !== tab)!,
+        source,
+      );
+    this.tabs.delete(id);
+    this.clearTabRefs(tab);
+    for (const child of tab.children) child.close();
+    tab.page.close();
+    await this.browser!.call('Target.closeTarget', { targetId: id });
+    this.update();
+  }
+  private async removeTarget(id: string): Promise<void> {
+    const tab = this.tabs.get(id);
+    if (!tab) return;
+    const wasActive = this.activeTabId === id;
+    this.tabs.delete(id);
+    this.clearTabRefs(tab);
+    for (const child of tab.children) child.close();
+    tab.page.close();
+    if (this.disposed) return;
+    if (wasActive) {
+      this.activeTabId = '';
+      this.update({ selectedElement: undefined, inspecting: false });
+      void this.serialize(async () => {
+        const next = this.tabs.values().next().value as TabSession | undefined;
+        if (next) await this.activateTab(next, 'agent');
+        else if (this.state.status === 'ready') await this.createTab('about:blank', 'agent');
+      }).catch((error) => this.update({ error: redactBrowserText(error) }));
+    }
+    this.update();
   }
 
-  private async navigateInternal(url: string, source: 'human' | 'agent'): Promise<void> {
-    this.requireReady();
-    this.source = source;
-    this.documentId = '';
-    this.contextId = undefined;
-    this.update({ loading: true, inspecting: false, selectedElement: undefined });
-    const result = await this.page!.call('Page.navigate', { url: normalizeBrowserUrl(url) });
+  private requireActive(id: string): TabSession {
+    const tab = this.activeTab();
+    if (tab.info.id !== id) throw new Error('活动标签页已改变，请重新获取当前页面。');
+    return tab;
+  }
+  private async setSource(
+    tab: TabSession,
+    source: 'human' | 'agent',
+    only?: FrameContext,
+  ): Promise<void> {
+    tab.source = source;
+    for (const frame of only ? [only] : await this.collectFrames(tab)) {
+      if (frame.source === source) continue;
+      await this.bridge(
+        tab,
+        frame,
+        `globalThis.__workbenchPage.setSource(${JSON.stringify(source)})`,
+      );
+      frame.source = source;
+    }
+  }
+  navigate(url: string): Promise<void> {
+    const target = normalizeBrowserUrl(url);
+    const tab = this.activeTab();
+    this.humanTakeover('navigate');
+    return this.serialize(() =>
+      this.navigateInternal(this.requireActive(tab.info.id), target, 'human'),
+    );
+  }
+  private async navigateInternal(
+    tab: TabSession,
+    url: string,
+    source: 'human' | 'agent',
+  ): Promise<void> {
+    tab.source = source;
+    tab.activation++;
+    this.clearTabRefs(tab);
+    tab.edits = [];
+    if (this.activeTabId === tab.info.id)
+      this.update({ inspecting: false, selectedElement: undefined });
+    this.updateTab(tab, { loading: true });
+    const result = await tab.page.call('Page.navigate', { url: normalizeBrowserUrl(url) });
     if (result.errorText) {
-      this.update({ loading: false });
+      this.updateTab(tab, { loading: false });
       throw new Error(result.errorText);
     }
   }
-
   back(): Promise<void> {
     return this.historyMove(-1);
   }
   forward(): Promise<void> {
     return this.historyMove(1);
   }
-
   private historyMove(direction: number): Promise<void> {
+    const id = this.activeTab().info.id;
     this.humanTakeover(direction < 0 ? 'back' : 'forward');
     return this.serialize(async () => {
-      this.requireReady();
-      this.source = 'human';
-      const history = await this.page!.call('Page.getNavigationHistory');
-      const entry = history.entries[history.currentIndex + direction];
+      const tab = this.requireActive(id);
+      tab.source = 'human';
+      const h = await tab.page.call('Page.getNavigationHistory');
+      const entry = h.entries[h.currentIndex + direction];
       if (entry) {
-        this.documentId = '';
-        this.contextId = undefined;
-        await this.page!.call('Page.navigateToHistoryEntry', { entryId: entry.id });
+        tab.activation++;
+        this.clearTabRefs(tab);
+        await tab.page.call('Page.navigateToHistoryEntry', { entryId: entry.id });
       }
     });
   }
-
   reload(): Promise<void> {
+    const id = this.activeTab().info.id;
     this.humanTakeover('reload');
     return this.serialize(async () => {
-      this.requireReady();
-      this.source = 'human';
-      this.documentId = '';
-      this.contextId = undefined;
-      await this.page!.call('Page.reload');
+      const tab = this.requireActive(id);
+      tab.activation++;
+      tab.source = 'human';
+      this.clearTabRefs(tab);
+      await tab.page.call('Page.reload');
     });
   }
-
   resize(width: number, height: number): Promise<void> {
     if (!Number.isFinite(width) || !Number.isFinite(height))
       return Promise.reject(new Error('Invalid browser viewport'));
-    const w = Math.round(Math.min(1920, Math.max(320, width)));
-    const h = Math.round(Math.min(1400, Math.max(240, height)));
+    const w = Math.round(Math.min(1920, Math.max(320, width))),
+      h = Math.round(Math.min(1400, Math.max(100, height)));
     if (w === this.width && h === this.height) return Promise.resolve();
     this.width = w;
     this.height = h;
     if (this.state.status !== 'ready') return Promise.resolve();
     return this.serialize(async () => {
+      const tab = this.activeTab();
       if (this.frameAckTimer) clearTimeout(this.frameAckTimer);
       this.frameAckTimer = undefined;
-      await this.page!.call('Page.stopScreencast');
-      await this.page!.call('Emulation.setDeviceMetricsOverride', {
+      await tab.page.call('Page.stopScreencast');
+      await tab.page.call('Emulation.setDeviceMetricsOverride', {
         width: w,
         height: h,
         deviceScaleFactor: 2,
         mobile: false,
       });
-      await this.startScreencast();
+      await this.startScreencast(tab);
     });
   }
 
+  private async geometry(tab: TabSession, frame: FrameContext): Promise<FrameGeometry> {
+    if (frame.id === tab.mainFrameId) return { x: 0, y: 0, scaleX: 1, scaleY: 1 };
+    const parent = frame.parentId && tab.frames.get(frame.parentId);
+    if (!parent) throw new Error('无法定位此 iframe 的父页面');
+    const base = await this.geometry(tab, parent);
+    const owner = await parent.channel.call('DOM.getFrameOwner', { frameId: frame.id });
+    const contextId = await this.prepareFrame(tab, parent);
+    const node = await parent.channel.call('DOM.resolveNode', {
+      backendNodeId: owner.backendNodeId,
+      executionContextId: contextId,
+    });
+    if (!node.object.objectId) throw new Error('无法定位 iframe 元素');
+    try {
+      const result = await parent.channel.call('Runtime.callFunctionOn', {
+        objectId: node.object.objectId,
+        functionDeclaration:
+          'function(){const r=this.getBoundingClientRect();const t=getComputedStyle(this).transform;if(t!=="none"){const m=new DOMMatrix(t);if(!m.is2D||Math.abs(m.b)>0.0001||Math.abs(m.c)>0.0001)throw new Error("Rotated or 3D iframe coordinates are not supported");}const sx=r.width/this.offsetWidth,sy=r.height/this.offsetHeight;return{x:r.x+this.clientLeft*sx,y:r.y+this.clientTop*sy,scaleX:sx,scaleY:sy};}',
+        returnByValue: true,
+      });
+      if (result.exceptionDetails)
+        throw new Error(
+          result.exceptionDetails.exception?.description || result.exceptionDetails.text,
+        );
+      const box = result.result.value;
+      if (!box || !Number.isFinite(box.scaleX) || !box.scaleX || !box.scaleY)
+        throw new Error('iframe 当前不可见');
+      return {
+        x: base.x + box.x * base.scaleX,
+        y: base.y + box.y * base.scaleY,
+        scaleX: base.scaleX * box.scaleX,
+        scaleY: base.scaleY * box.scaleY,
+      };
+    } finally {
+      await parent.channel
+        .call('Runtime.releaseObject', { objectId: node.object.objectId })
+        .catch(() => {});
+    }
+  }
+  private async revealFrame(
+    tab: TabSession,
+    frame: FrameContext,
+    guard?: () => void,
+  ): Promise<void> {
+    if (frame.id === tab.mainFrameId) return;
+    const parent = frame.parentId && tab.frames.get(frame.parentId);
+    if (!parent) throw new Error('无法定位此 iframe 的父页面');
+    await this.revealFrame(tab, parent, guard);
+    const owner = await parent.channel.call('DOM.getFrameOwner', { frameId: frame.id });
+    guard?.();
+    await parent.channel.call('DOM.scrollIntoViewIfNeeded', { backendNodeId: owner.backendNodeId });
+  }
+  private async inputPoint(
+    tab: TabSession,
+    frame: FrameContext,
+    localRef: string,
+    guard: () => void,
+  ): Promise<{ x: number; y: number }> {
+    await this.revealFrame(tab, frame, guard);
+    const box = await this.bridge(
+      tab,
+      frame,
+      `globalThis.__workbenchPage.bounds(${JSON.stringify(localRef)})`,
+      guard,
+    );
+    if (box.disabled) throw new Error('Element is disabled');
+    const offset = await this.geometry(tab, frame);
+    const point = { x: offset.x + box.x * offset.scaleX, y: offset.y + box.y * offset.scaleY };
+    const hit = await this.hitFrame(tab, point.x, point.y);
+    if (frame.id !== tab.mainFrameId && hit.id !== frame.id)
+      throw new Error('此 iframe 元素被父页面的其它元素遮挡');
+    guard();
+    return point;
+  }
+  private async hitFrame(tab: TabSession, x: number, y: number): Promise<FrameContext> {
+    let frame = this.mainFrame(tab);
+    for (let depth = 0; depth < 10; depth++) {
+      const offset = await this.geometry(tab, frame);
+      const local = { x: (x - offset.x) / offset.scaleX, y: (y - offset.y) / offset.scaleY };
+      const contextId = await this.prepareFrame(tab, frame);
+      const hit = await frame.channel.call('Runtime.evaluate', {
+        expression: `(()=>{let el=document.elementFromPoint(${local.x},${local.y});while(el?.shadowRoot){const next=el.shadowRoot.elementFromPoint(${local.x},${local.y});if(!next||next===el)break;el=next;}return el;})()`,
+        contextId,
+      });
+      if (!hit.result.objectId) return frame;
+      let childId: string | undefined;
+      try {
+        const described = await frame.channel.call('DOM.describeNode', {
+          objectId: hit.result.objectId,
+        });
+        childId = described.node.frameId;
+      } finally {
+        await frame.channel
+          .call('Runtime.releaseObject', { objectId: hit.result.objectId })
+          .catch(() => {});
+      }
+      const child = childId && tab.frames.get(childId);
+      if (!child) return frame;
+      const geometry = await this.geometry(tab, child);
+      const viewport = await this.bridge(tab, child, '({width:innerWidth,height:innerHeight})');
+      const cx = (x - geometry.x) / geometry.scaleX,
+        cy = (y - geometry.y) / geometry.scaleY;
+      if (cx < 0 || cy < 0 || cx >= viewport.width || cy >= viewport.height) return frame;
+      frame = child;
+    }
+    throw new Error('iframe 嵌套过深，无法安全定位此坐标');
+  }
+  private expose(
+    tab: TabSession,
+    frame: FrameContext,
+    element: any,
+    geometry?: FrameGeometry,
+  ): ElementRef {
+    const documentId = frame.documentId || String(element.documentId || '');
+    const ref = `${tab.info.id}/${tab.activation}/${frame.id}/${frame.revision}/${element.ref}`;
+    this.refs.set(ref, {
+      tabId: tab.info.id,
+      activation: tab.activation,
+      frameId: frame.id,
+      revision: frame.revision,
+      documentId,
+      localRef: element.ref,
+    });
+    const bounds =
+      element.bounds && geometry
+        ? {
+            x: geometry.x + element.bounds.x * geometry.scaleX,
+            y: geometry.y + element.bounds.y * geometry.scaleY,
+            width: element.bounds.width * geometry.scaleX,
+            height: element.bounds.height * geometry.scaleY,
+          }
+        : element.bounds;
+    return {
+      ...element,
+      ref,
+      nodeId: element.ref,
+      tabId: tab.info.id,
+      frameId: frame.id,
+      documentId,
+      bounds,
+    };
+  }
+  private async resolveRef(
+    ref: string,
+  ): Promise<{ tab: TabSession; frame: FrameContext; scope: ScopedElement }> {
+    if (typeof ref !== 'string' || ref.length > 1500) throw new Error('元素引用无效');
+    const scope = this.refs.get(ref),
+      tab = this.activeTab();
+    if (!scope || scope.tabId !== tab.info.id || scope.activation !== tab.activation)
+      throw new Error('元素引用已失效或属于其他标签页，请重新获取 snapshot/query。');
+    const frame = tab.frames.get(scope.frameId);
+    if (!frame) throw new Error('元素所在 iframe 已移除');
+    await this.prepareFrame(tab, frame);
+    if (frame.revision !== scope.revision || frame.documentId !== scope.documentId)
+      throw new Error('元素所在文档已改变，请重新获取引用。');
+    return { tab, frame, scope };
+  }
+  private async atPoint(tab: TabSession, x: number, y: number): Promise<ElementRef | null> {
+    await this.collectFrames(tab);
+    const frame = await this.hitFrame(tab, x, y);
+    const offset = await this.geometry(tab, frame);
+    const element = await this.bridge(
+      tab,
+      frame,
+      `globalThis.__workbenchPage.atPoint(${(x - offset.x) / offset.scaleX},${(y - offset.y) / offset.scaleY})`,
+    );
+    return element ? this.expose(tab, frame, element, offset) : null;
+  }
   dispatchInput(input: BrowserInput): Promise<void> {
     if (!input || typeof input !== 'object')
       return Promise.reject(new Error('Invalid browser input'));
+    const id = this.activeTab().info.id;
+    if (input.tabId !== undefined && input.tabId !== id)
+      return Promise.reject(new Error('忽略了来自旧标签页的输入。'));
     if (input.type === 'resize') return this.resize(input.width, input.height);
     if (
       (input.type === 'mouse' && input.action === 'down') ||
@@ -676,13 +1269,12 @@ export class BrowserRuntime {
         input.type === 'mouse' ? 'mouse-down' : input.type === 'key' ? 'key-down' : input.type,
       );
     return this.serialize(async () => {
-      this.requireReady();
+      const tab = this.requireActive(id);
       if (input.type === 'mouse' && input.action === 'up' && this.suppressMouseUp) {
         this.suppressMouseUp = false;
         return;
       }
-      await this.setSource('human');
-      if (input.type === 'mouse' || input.type === 'wheel') {
+      if (input.type === 'mouse' || input.type === 'wheel')
         if (
           ![input.x, input.y].every(Number.isFinite) ||
           input.x < 0 ||
@@ -691,13 +1283,13 @@ export class BrowserRuntime {
           input.y > this.height
         )
           throw new Error('Pointer is outside the browser viewport');
-      }
       if (
         'modifiers' in input &&
         input.modifiers !== undefined &&
         (!Number.isInteger(input.modifiers) || input.modifiers < 0 || input.modifiers > 15)
       )
         throw new Error('Invalid keyboard modifiers');
+      await this.setSource(tab, 'human');
       if (input.type === 'mouse') {
         if (
           !['move', 'down', 'up'].includes(input.action) ||
@@ -705,18 +1297,12 @@ export class BrowserRuntime {
         )
           throw new Error('Invalid mouse input');
         if (this.state.inspecting && input.action === 'down') {
-          const element = await this.bridge<ElementRef | null>(
-            `globalThis.__workbenchPage.atPoint(${input.x},${input.y})`,
-          );
+          const element = await this.atPoint(tab, input.x, input.y);
           this.suppressMouseUp = true;
-          if (element) {
-            await this.bridge(`globalThis.__workbenchPage.outline(${JSON.stringify(element.ref)})`);
-            this.update({ inspecting: false, selectedElement: element });
-            this.options.onSelected(element);
-          }
+          if (element) await this.selectElementInternal(element.ref);
           return;
         }
-        await this.page!.call('Input.dispatchMouseEvent', {
+        await tab.page.call('Input.dispatchMouseEvent', {
           type: { move: 'mouseMoved', down: 'mousePressed', up: 'mouseReleased' }[input.action],
           x: input.x,
           y: input.y,
@@ -727,7 +1313,7 @@ export class BrowserRuntime {
       } else if (input.type === 'wheel') {
         if (![input.deltaX, input.deltaY].every(Number.isFinite))
           throw new Error('Invalid scroll input');
-        await this.page!.call('Input.dispatchMouseEvent', {
+        await tab.page.call('Input.dispatchMouseEvent', {
           type: 'mouseWheel',
           x: input.x,
           y: input.y,
@@ -738,7 +1324,7 @@ export class BrowserRuntime {
       } else if (input.type === 'text') {
         if (typeof input.text !== 'string' || input.text.length > 20_000)
           throw new Error('Text input is too long');
-        await this.page!.call('Input.insertText', { text: input.text });
+        await tab.page.call('Input.insertText', { text: input.text });
       } else if (input.type === 'key') {
         if (
           !['down', 'up'].includes(input.action) ||
@@ -749,7 +1335,7 @@ export class BrowserRuntime {
           (input.text?.length || 0) > 100
         )
           throw new Error('Invalid key input');
-        await this.page!.call('Input.dispatchKeyEvent', {
+        await tab.page.call('Input.dispatchKeyEvent', {
           type: input.action === 'up' ? 'keyUp' : input.text ? 'keyDown' : 'rawKeyDown',
           key: input.key,
           code: input.code,
@@ -761,32 +1347,363 @@ export class BrowserRuntime {
       } else throw new Error('Unsupported browser input');
     });
   }
+  setInspect(enabled: boolean): Promise<void> {
+    const id = this.activeTab().info.id;
+    return this.serialize(async () => {
+      const tab = this.requireActive(id);
+      this.update({ inspecting: !!enabled });
+      if (!enabled) await this.clearOutline(tab);
+    });
+  }
 
-  async setInspect(enabled: boolean): Promise<void> {
-    this.requireReady();
-    this.update({ inspecting: !!enabled });
-    if (!enabled)
-      await this.serialize(() => this.bridge('globalThis.__workbenchPage.outline(null)'));
+  snapshot(): Promise<ToolResult> {
+    const id = this.activeTab().info.id;
+    return this.serialize(() => this.snapshotInternal(this.requireActive(id)));
+  }
+  private async snapshotInternal(tab: TabSession): Promise<ToolResult> {
+    const frames = await this.collectFrames(tab),
+      items: ElementRef[] = [],
+      details: any[] = [],
+      texts: string[] = [];
+    for (const frame of frames) {
+      try {
+        const value = await this.bridge(tab, frame, 'globalThis.__workbenchPage.snapshot()');
+        const geometry = await this.geometry(tab, frame);
+        frame.documentId = value.documentId;
+        items.push(...value.elements.map((item: any) => this.expose(tab, frame, item, geometry)));
+        texts.push(value.text || '');
+        details.push({
+          frameId: frame.id,
+          parentId: frame.parentId,
+          url: evidenceUrl(frame.url),
+          documentId: value.documentId,
+        });
+      } catch (error) {
+        details.push({
+          frameId: frame.id,
+          url: evidenceUrl(frame.url),
+          error: redactBrowserText(error instanceof Error ? error.message : error),
+        });
+      }
+    }
+    if (!details.some((frame) => frame.documentId)) throw new Error('当前页面框架尚未可读');
+    return {
+      text: JSON.stringify(
+        {
+          tabId: tab.info.id,
+          url: evidenceUrl(tab.info.url),
+          title: tab.info.title,
+          documentId: this.mainFrame(tab).documentId,
+          text: texts.join('\n\n').slice(0, 12_000),
+          elements: items.slice(0, 240),
+          frames: details,
+        },
+        null,
+        2,
+      ),
+    };
+  }
+  screenshot(): Promise<ToolResult> {
+    const id = this.activeTab().info.id;
+    return this.serialize(() => this.screenshotInternal(this.requireActive(id)));
+  }
+  private async screenshotInternal(tab: TabSession): Promise<ToolResult> {
+    const frames = await this.collectFrames(tab),
+      masked: FrameContext[] = [];
+    const activation = tab.activation;
+    const scopes: Array<{
+      id: string;
+      channel: BrowserChannel;
+      revision: number;
+      documentId?: string;
+    }> = [];
+    const unchanged = async () => {
+      const current = await this.collectFrames(tab);
+      if (
+        this.activeTabId !== tab.info.id ||
+        tab.activation !== activation ||
+        current.length !== scopes.length
+      )
+        throw new Error('页面在截图期间发生变化，已丢弃截图，请重试。');
+      for (const scope of scopes) {
+        const frame = current.find((item) => item.id === scope.id);
+        if (!frame || frame.channel !== scope.channel)
+          throw new Error('页面框架在截图期间发生变化，已丢弃截图。');
+        await this.prepareFrame(tab, frame);
+        if (frame.revision !== scope.revision || frame.documentId !== scope.documentId)
+          throw new Error('页面文档在截图期间发生变化，已丢弃截图，请重试。');
+      }
+    };
+    try {
+      for (const frame of frames) {
+        await this.bridge(tab, frame, 'globalThis.__workbenchPage.mask(true)');
+        masked.push(frame);
+        scopes.push({
+          id: frame.id,
+          channel: frame.channel,
+          revision: frame.revision,
+          documentId: frame.documentId,
+        });
+      }
+      await unchanged();
+      const result = await tab.page.call('Page.captureScreenshot', {
+        format: 'png',
+        captureBeyondViewport: false,
+      });
+      await unchanged();
+      return {
+        text: `BrowserOS neo 页面截图（tab ${tab.info.id}）：${evidenceUrl(tab.info.url)}。可访问的敏感输入框已遮盖。`,
+        image: result.data,
+      };
+    } finally {
+      for (const frame of masked)
+        await this.bridge(tab, frame, 'globalThis.__workbenchPage.mask(false)').catch(() => {});
+    }
+  }
+  queryElements(query: ElementQuery & { frameId?: string }): Promise<ElementQueryResult> {
+    const id = this.activeTab().info.id;
+    return this.serialize(() => this.queryInternal(this.requireActive(id), query));
+  }
+  private async queryInternal(
+    tab: TabSession,
+    query: ElementQuery & { frameId?: string },
+  ): Promise<ElementQueryResult> {
+    if (!query || typeof query !== 'object' || Array.isArray(query))
+      throw new Error('查询条件无效');
+    if (
+      Object.keys(query).some(
+        (key) => !['selector', 'text', 'role', 'exact', 'limit', 'frameId'].includes(key),
+      )
+    )
+      throw new Error('查询含未知字段');
+    for (const key of ['selector', 'text', 'role', 'frameId'] as const)
+      if (query[key] !== undefined && (typeof query[key] !== 'string' || query[key]!.length > 1000))
+        throw new Error('查询条件格式无效');
+    if (![query.selector, query.text, query.role].some((value) => value?.trim()))
+      throw new Error('请提供 selector、文字或 role');
+    if (query.exact !== undefined && typeof query.exact !== 'boolean')
+      throw new Error('exact 必须为布尔值');
+    const limit = query.limit ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100)
+      throw new Error('查询数量必须在1到100之间');
+    const all = await this.collectFrames(tab),
+      frames = query.frameId ? all.filter((frame) => frame.id === query.frameId) : all;
+    if (!frames.length) throw new Error('指定的 iframe 不存在');
+    const { frameId: _, ...criteria } = query;
+    const elements: ElementRef[] = [];
+    const warnings: Array<{ frameId: string; message: string }> = [];
+    let truncated = false;
+    for (const frame of frames) {
+      try {
+        const result = await this.bridge(
+          tab,
+          frame,
+          `globalThis.__workbenchPage.query(${JSON.stringify({ ...criteria, limit })})`,
+        );
+        truncated ||= result.truncated;
+        if (!result.elements.length) continue;
+        const geometry = await this.geometry(tab, frame);
+        elements.push(
+          ...result.elements.map((element: any) => this.expose(tab, frame, element, geometry)),
+        );
+      } catch (error) {
+        if (query.frameId) throw error;
+        warnings.push({
+          frameId: frame.id,
+          message: redactBrowserText(error instanceof Error ? error.message : error),
+        });
+      }
+    }
+    const result = {
+      documentId: this.mainFrame(tab).documentId || '',
+      elements: elements.slice(0, limit),
+      truncated: truncated || elements.length > limit,
+      ...(warnings.length ? { warnings } : {}),
+    };
+    return result;
+  }
+  getElementDetails(ref: string): Promise<ElementDetails> {
+    return this.serialize(() => this.detailsInternal(ref));
+  }
+  private async detailsInternal(ref: string): Promise<ElementDetails> {
+    const { tab, frame, scope } = await this.resolveRef(ref);
+    const detail = await this.bridge(
+      tab,
+      frame,
+      `globalThis.__workbenchPage.inspect(${JSON.stringify(scope.localRef)})`,
+    );
+    return this.exposeDetails(tab, frame, detail);
+  }
+  private async exposeDetails(
+    tab: TabSession,
+    frame: FrameContext,
+    detail: any,
+  ): Promise<ElementDetails> {
+    const geometry = await this.geometry(tab, frame);
+    return {
+      ...detail,
+      ...this.expose(tab, frame, detail, geometry),
+      documentId: frame.documentId || detail.documentId,
+      ancestors: (detail.ancestors || []).map((element: any) =>
+        this.expose(tab, frame, element, geometry),
+      ),
+    };
+  }
+  selectElement(ref: string): Promise<ElementDetails> {
+    const scope = this.refs.get(ref);
+    if (!scope || scope.tabId !== this.activeTabId)
+      return Promise.reject(new Error('元素引用已失效或属于其他标签页'));
+    this.humanTakeover('inspect');
+    return this.serialize(() => this.selectElementInternal(ref));
+  }
+  private async selectElementInternal(ref: string): Promise<ElementDetails> {
+    const { tab, frame, scope } = await this.resolveRef(ref);
+    await this.setSource(tab, 'human');
+    await this.revealFrame(tab, frame);
+    await this.bridge(
+      tab,
+      frame,
+      `globalThis.__workbenchPage.reveal(${JSON.stringify(scope.localRef)})`,
+    );
+    await this.clearOutline(tab);
+    await this.bridge(
+      tab,
+      frame,
+      `globalThis.__workbenchPage.outline(${JSON.stringify(scope.localRef)})`,
+    );
+    const detail = await this.detailsInternal(ref);
+    this.update({ selectedElement: detail, inspecting: false });
+    this.options.onSelected(detail);
+    return detail;
+  }
+  editElement(ref: string, changes: ElementEdit): Promise<ElementEditResult> {
+    const scope = this.refs.get(ref);
+    if (!scope || scope.tabId !== this.activeTabId)
+      return Promise.reject(new Error('元素引用已失效或属于其他标签页'));
+    this.humanTakeover('edit');
+    return this.serialize(() => this.editInternal(ref, changes, 'human'));
+  }
+  private validateEdit(changes: ElementEdit): void {
+    if (
+      !changes ||
+      typeof changes !== 'object' ||
+      Array.isArray(changes) ||
+      Object.keys(changes).some((key) => !['text', 'styles'].includes(key))
+    )
+      throw new Error('元素修改格式无效');
+    if (
+      changes.text !== undefined &&
+      (typeof changes.text !== 'string' || changes.text.length > 20_000)
+    )
+      throw new Error('文字内容过长或无效');
+    if (
+      changes.styles !== undefined &&
+      (typeof changes.styles !== 'object' ||
+        !changes.styles ||
+        Array.isArray(changes.styles) ||
+        Object.keys(changes.styles).length > 30 ||
+        Object.entries(changes.styles).some(
+          ([key, value]) => key.length > 100 || typeof value !== 'string' || value.length > 500,
+        ))
+    )
+      throw new Error('样式修改格式无效');
+    if (changes.text === undefined && !Object.keys(changes.styles || {}).length)
+      throw new Error('没有提供修改内容');
+  }
+  private registerEdit(tab: TabSession, frame: FrameContext, localId: string): string {
+    const id = `${tab.info.id}/${frame.id}/${frame.documentId}/${localId}`;
+    if (!tab.edits.some((edit) => edit.id === id))
+      tab.edits.push({ id, frameId: frame.id, documentId: frame.documentId || '', localId });
+    return id;
+  }
+  private async editInternal(
+    ref: string,
+    changes: ElementEdit,
+    source: 'human' | 'agent',
+    guard?: () => void,
+  ): Promise<ElementEditResult> {
+    this.validateEdit(changes);
+    const { tab, frame, scope } = await this.resolveRef(ref);
+    await this.setSource(tab, source, frame);
+    const result = await this.bridge(
+      tab,
+      frame,
+      `globalThis.__workbenchPage.edit(${JSON.stringify({ ref: scope.localRef, ...changes })})`,
+      guard,
+    );
+    const editId = this.registerEdit(tab, frame, result.editId);
+    const metadata = tab.edits.find((edit) => edit.id === editId)!;
+    metadata.localRef = scope.localRef;
+    metadata.changes = structuredClone(changes);
+    await this.bridge(
+      tab,
+      frame,
+      `globalThis.__workbenchPage.outline(${JSON.stringify(result.element.ref)})`,
+    );
+    const element = await this.exposeDetails(tab, frame, result.element);
+    this.update({ selectedElement: element });
+    this.options.onSelected(element);
+    return { editId, element };
+  }
+  undoEdit(editId?: string): Promise<ElementEditResult> {
+    const tab = this.activeTab();
+    if (editId !== undefined && typeof editId !== 'string')
+      return Promise.reject(new Error('修改ID无效'));
+    this.humanTakeover('undo');
+    return this.serialize(() =>
+      this.undoInternal(this.requireActive(tab.info.id), editId, 'human'),
+    );
+  }
+  private async undoInternal(
+    tab: TabSession,
+    id: string | undefined,
+    source: 'human' | 'agent',
+    guard?: () => void,
+  ): Promise<ElementEditResult> {
+    const edit = id ? tab.edits.find((item) => item.id === id) : tab.edits.at(-1);
+    if (!edit) throw new Error('当前标签页没有可撤销的修改');
+    const frame = tab.frames.get(edit.frameId);
+    if (!frame) throw new Error('修改所在框架已移除');
+    await this.prepareFrame(tab, frame);
+    if (frame.documentId !== edit.documentId) throw new Error('修改所在文档已改变，无法撤销');
+    await this.setSource(tab, source, frame);
+    const result = await this.bridge(
+      tab,
+      frame,
+      `globalThis.__workbenchPage.undo(${JSON.stringify(edit.localId)})`,
+      guard,
+    );
+    tab.edits = tab.edits.filter((item) => item.id !== edit.id);
+    await this.bridge(
+      tab,
+      frame,
+      `globalThis.__workbenchPage.outline(${JSON.stringify(result.element.ref)})`,
+    );
+    const element = await this.exposeDetails(tab, frame, result.element);
+    this.update({ selectedElement: element });
+    this.options.onSelected(element);
+    return { editId: edit.id, element };
   }
 
   startRecording(): void {
-    this.requireReady();
+    const tab = this.activeTab();
     if (this.recording) return;
     this.recording = {
       id: randomUUID(),
-      title: this.state.title || '浏览器操作',
+      title: tab.info.title || '浏览器操作',
       startedAt: Date.now(),
       steps: [],
     };
     this.update({ recording: true });
     this.appendStep({
       kind: 'navigate',
-      description: `打开 ${evidenceUrl(this.state.url)}`,
-      url: evidenceUrl(this.state.url),
+      description: `打开 ${evidenceUrl(tab.info.url)}`,
+      url: evidenceUrl(tab.info.url),
       source: 'human',
+      tabId: tab.info.id,
+      frameId: tab.mainFrameId,
     });
   }
-
   stopRecording(): Recording {
     if (!this.recording) throw new Error('当前没有录制');
     const recording = structuredClone({ ...this.recording, endedAt: Date.now() });
@@ -794,41 +1711,54 @@ export class BrowserRuntime {
     this.update({ recording: false });
     return recording;
   }
-
-  private recordEvent(event: any): void {
+  private recordEvent(tab: TabSession, frame: FrameContext, event: any): void {
     if (
       !this.recording ||
       !event ||
-      !['click', 'fill', 'select', 'key', 'scroll'].includes(event.kind)
+      !['click', 'fill', 'select', 'key', 'scroll', 'edit', 'undo'].includes(event.kind) ||
+      !['human', 'agent'].includes(event.source)
     )
       return;
-    if (event.source !== 'human' && event.source !== 'agent') return;
+    if (typeof event.docId !== 'string') return;
+    if (frame.documentId && frame.documentId !== event.docId) return;
+    frame.documentId = event.docId;
     const target =
       event.target && typeof event.target.ref === 'string'
-        ? {
-            ref: event.target.ref.slice(0, 100),
-            tag: String(event.target.tag || '').slice(0, 30),
+        ? this.expose(tab, frame, {
+            ...event.target,
             name: redactBrowserText(event.target.name).slice(0, 180),
-            selector:
-              typeof event.target.selector === 'string'
-                ? event.target.selector.slice(0, 500)
-                : undefined,
-          }
+          })
         : undefined;
-    const value = typeof event.value === 'string' ? redactBrowserText(event.value) : undefined;
-    const verb = { click: '点击', fill: '填写', select: '选择', key: '按键', scroll: '滚动' }[
-      event.kind as 'click'
-    ];
+    const value =
+      typeof event.value === 'string'
+        ? ['edit', 'undo'].includes(event.kind)
+          ? recordedEditValue(event.value)
+          : redactBrowserText(event.value)
+        : undefined;
+    const verbs: Record<string, string> = {
+      click: '点击',
+      fill: '填写',
+      select: '选择',
+      key: '按键',
+      scroll: '滚动',
+      edit: '修改元素',
+      undo: '撤销修改',
+    };
+    const editId =
+      typeof event.editId === 'string' ? this.registerEdit(tab, frame, event.editId) : undefined;
+    if (event.kind === 'undo' && editId) tab.edits = tab.edits.filter((edit) => edit.id !== editId);
     this.appendStep({
       kind: event.kind,
-      description: `${verb}${target?.name ? `「${target.name}」` : ''}${value && ['key', 'scroll'].includes(event.kind) ? ` ${value}` : ''}`,
-      url: evidenceUrl(this.state.url),
+      description: `${verbs[event.kind]}${target?.name ? `「${target.name}」` : ''}${value && ['key', 'scroll'].includes(event.kind) ? ` ${value}` : ''}`,
+      url: evidenceUrl(frame.url || tab.info.url),
       source: event.source,
       target,
       value,
+      tabId: tab.info.id,
+      frameId: frame.id,
+      editId,
     });
   }
-
   private appendStep(data: Omit<RecordedStep, 'id' | 'timestamp'>): void {
     if (!this.recording || this.recording.steps.length >= 2000) return;
     const step: RecordedStep = { ...data, id: randomUUID(), timestamp: Date.now() };
@@ -837,6 +1767,8 @@ export class BrowserRuntime {
       last &&
       ['fill', 'select', 'scroll'].includes(step.kind) &&
       last.kind === step.kind &&
+      last.tabId === step.tabId &&
+      last.frameId === step.frameId &&
       last.target?.ref === step.target?.ref &&
       last.source === step.source &&
       step.timestamp - last.timestamp < 1500
@@ -847,69 +1779,91 @@ export class BrowserRuntime {
     this.options.onStep(structuredClone(step));
   }
 
-  snapshot(): Promise<ToolResult> {
-    return this.serialize(() => this.snapshotInternal());
-  }
-
-  private async snapshotInternal(): Promise<ToolResult> {
-    const snapshot = await this.bridge('globalThis.__workbenchPage.snapshot()');
-    this.documentId = snapshot.documentId;
-    snapshot.url = evidenceUrl(snapshot.url);
-    return { text: JSON.stringify(snapshot, null, 2) };
-  }
-
-  screenshot(): Promise<ToolResult> {
-    return this.serialize(() => this.screenshotInternal());
-  }
-
-  private async screenshotInternal(): Promise<ToolResult> {
-    this.requireReady();
-    try {
-      await this.bridge('globalThis.__workbenchPage.mask(true)');
-      const result = await this.page!.call('Page.captureScreenshot', {
-        format: 'png',
-        captureBeyondViewport: false,
-      });
-      return {
-        text: `当前 BrowserOS neo 页面截图：${evidenceUrl(this.state.url)}。敏感输入框已遮盖。`,
-        image: result.data,
-      };
-    } finally {
-      await this.bridge('globalThis.__workbenchPage.mask(false)').catch(() => {});
-    }
-  }
-
   getTools(): BrowserTool[] {
     const tool = (
       name: string,
       description: string,
       properties: Record<string, unknown> = {},
       required: string[] = [],
+      target = true,
     ): BrowserTool => ({
       name: `workbench_browser_${name}`,
       description,
-      inputSchema: { type: 'object', properties, required, additionalProperties: false },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ...(target
+            ? {
+                tabId: {
+                  type: 'string',
+                  description: '目标必须是当前活动标签页；其他页面先用 switch_tab。',
+                },
+              }
+            : {}),
+          ...properties,
+        },
+        required,
+        additionalProperties: false,
+      },
     });
     const ref = {
       type: 'string',
-      description: '当前 snapshot 返回的元素 ref；导航后必须重新取得。',
+      description: '当前活动标签页 snapshot/query 返回的精确元素引用；切换或导航后必须重取。',
     };
     return [
+      tool('tabs', '列出工作台中的真实浏览器标签页及活动页。', {}, [], false),
       tool(
-        'snapshot',
-        '查看 App 内同一个 BrowserOS neo 页面的文字和可操作元素；操作前先获取 ref。',
+        'new_tab',
+        '新建并显示工作台内的标签页；不打开系统浏览器。',
+        { url: { type: 'string' } },
+        [],
+        false,
       ),
-      tool('screenshot', '获取同一页面截图，敏感输入框遮盖。'),
-      tool('navigate', '在 App 内浏览器打开 HTTP(S) 地址。', { url: { type: 'string' } }, ['url']),
-      tool('click', '点击当前 snapshot 中的元素。', { ref }, ['ref']),
-      tool('fill', '填写一个文本输入框。', { ref, value: { type: 'string' } }, ['ref', 'value']),
-      tool('select', '选择下拉框中的一个 option value。', { ref, value: { type: 'string' } }, [
+      tool(
+        'switch_tab',
+        '切换可见标签页；旧元素引用失效，之后先获取 snapshot。',
+        { tabId: { type: 'string' } },
+        ['tabId'],
+        false,
+      ),
+      tool('close_tab', '关闭指定标签页。', { tabId: { type: 'string' } }, ['tabId'], false),
+      tool('snapshot', '读取当前标签页及可访问iframe的DOM文字、元素与frame标识。'),
+      tool('screenshot', '获取当前可见标签页截图，遮盖可访问frame中的敏感输入框。'),
+      tool('query', '按CSS selector、文字或role查找精确DOM节点（含开放Shadow DOM）。', {
+        selector: { type: 'string' },
+        text: { type: 'string' },
+        role: { type: 'string' },
+        exact: { type: 'boolean' },
+        limit: { type: 'integer', minimum: 1, maximum: 100 },
+        frameId: { type: 'string' },
+      }),
+      tool('inspect', '读取精确元素属性、计算样式、祖先与所在frame，不改变页面。', { ref }, [
+        'ref',
+      ]),
+      tool(
+        'edit',
+        '临时修改精确元素的文字或行内样式；这是当前页面预览，不是源码修改。',
+        {
+          ref,
+          text: { type: 'string' },
+          styles: { type: 'object', additionalProperties: { type: 'string' } },
+        },
+        ['ref'],
+      ),
+      tool('undo', '撤销当前标签页的预览修改。', { editId: { type: 'string' } }),
+      tool('navigate', '在当前标签页打开HTTP(S)地址。', { url: { type: 'string' } }, ['url']),
+      tool('click', '点击当前snapshot/query中的精确元素。', { ref }, ['ref']),
+      tool('fill', '填写当前元素引用对应的文本输入框。', { ref, value: { type: 'string' } }, [
+        'ref',
+        'value',
+      ]),
+      tool('select', '选择下拉框的option value。', { ref, value: { type: 'string' } }, [
         'ref',
         'value',
       ]),
       tool(
         'press',
-        '发送 Enter、Tab、Escape、Backspace 或方向键。',
+        '发送Enter、Tab、Escape、Backspace或方向键。',
         {
           key: {
             type: 'string',
@@ -929,43 +1883,105 @@ export class BrowserRuntime {
       ),
       tool(
         'scroll',
-        '滚动当前浏览器页面。',
+        '滚动当前标签页。',
         { deltaY: { type: 'number', minimum: -1500, maximum: 1500 } },
         ['deltaY'],
       ),
-      tool('diagnostics', '读取当前浏览器的 console、异常和网络状态摘要，不包含请求或响应正文。'),
+      tool('diagnostics', '读取当前标签页console和网络摘要，不包含请求正文。'),
     ];
   }
-
   callTool(name: string, args: unknown): Promise<ToolResult> {
-    const generation = this.leaseGeneration;
+    const generation = this.leaseGeneration,
+      capturedTab = this.activeTabId;
     return this.serialize(async () => {
       try {
-        this.requireReady();
+        this.activeTab();
         if (!args || typeof args !== 'object' || Array.isArray(args))
           throw new Error('Tool arguments must be an object');
-        const input = args as Record<string, unknown>;
-        const definition = this.getTools().find((tool) => tool.name === name);
+        const input = args as Record<string, unknown>,
+          definition = this.getTools().find((tool) => tool.name === name);
         if (!definition) throw new Error('Unknown browser tool');
         const properties = definition.inputSchema.properties as Record<string, unknown>;
         if (Object.keys(input).some((key) => !(key in properties)))
           throw new Error('Unexpected browser tool argument');
-        if (name === 'workbench_browser_snapshot') return await this.snapshotInternal();
-        if (name === 'workbench_browser_screenshot') return await this.screenshotInternal();
-        if (name === 'workbench_browser_diagnostics')
-          return { text: JSON.stringify(this.diagnostics, null, 2) };
+        if (
+          input.tabId !== undefined &&
+          (typeof input.tabId !== 'string' || input.tabId.length > 200)
+        )
+          throw new Error('tabId is invalid');
         const assertLease = () => {
           if (!this.agentAllowed || generation !== this.leaseGeneration)
-            throw new Error('用户已接管浏览器；请停止操作，等待新的用户请求。');
+            throw new Error('用户已接管浏览器，请等待新的用户请求。');
         };
+        const json = (value: unknown): ToolResult => ({ text: JSON.stringify(value, null, 2) });
+        if (name === 'workbench_browser_tabs')
+          return json({ activeTabId: this.activeTabId, tabs: this.listTabs() });
+        if (name === 'workbench_browser_new_tab') {
+          assertLease();
+          if (input.url !== undefined && typeof input.url !== 'string')
+            throw new Error('url is invalid');
+          return json(
+            await this.createTab(
+              input.url === undefined ? 'about:blank' : normalizeBrowserUrl(input.url),
+              'agent',
+              assertLease,
+            ),
+          );
+        }
+        if (name === 'workbench_browser_switch_tab') {
+          assertLease();
+          const target = typeof input.tabId === 'string' && this.tabs.get(input.tabId);
+          if (!target) throw new Error('标签页不存在');
+          await this.activateTab(target, 'agent');
+          return json({ activeTabId: this.activeTabId, tabs: this.listTabs() });
+        }
+        if (name === 'workbench_browser_close_tab') {
+          assertLease();
+          if (typeof input.tabId !== 'string') throw new Error('tabId is required');
+          await this.closeTabInternal(input.tabId, 'agent');
+          return json({ activeTabId: this.activeTabId, tabs: this.listTabs() });
+        }
+        const tab = this.requireActive(typeof input.tabId === 'string' ? input.tabId : capturedTab);
+        if (name === 'workbench_browser_snapshot') return await this.snapshotInternal(tab);
+        if (name === 'workbench_browser_screenshot') return await this.screenshotInternal(tab);
+        if (name === 'workbench_browser_diagnostics') return json(tab.diagnostics);
+        if (name === 'workbench_browser_query') {
+          const { tabId: _, ...query } = input;
+          return json(await this.queryInternal(tab, query as ElementQuery & { frameId?: string }));
+        }
+        if (name === 'workbench_browser_inspect') {
+          if (typeof input.ref !== 'string') throw new Error('ref is required');
+          return json(await this.detailsInternal(input.ref));
+        }
         assertLease();
         if (name === 'workbench_browser_navigate') {
           if (typeof input.url !== 'string') throw new Error('url is required');
-          await this.navigateInternal(normalizeBrowserUrl(input.url), 'agent');
-          return { text: '页面正在加载。继续操作前请获取新的 snapshot。' };
+          await this.navigateInternal(tab, normalizeBrowserUrl(input.url), 'agent');
+          return { text: '页面正在加载，继续前请重新获取 snapshot。' };
         }
-        await this.setSource('agent');
-        assertLease();
+        if (name === 'workbench_browser_edit') {
+          if (typeof input.ref !== 'string') throw new Error('ref is required');
+          return json(
+            await this.editInternal(
+              input.ref,
+              {
+                ...(input.text !== undefined ? { text: input.text as string } : {}),
+                ...(input.styles !== undefined
+                  ? { styles: input.styles as Record<string, string> }
+                  : {}),
+              },
+              'agent',
+              assertLease,
+            ),
+          );
+        }
+        if (name === 'workbench_browser_undo') {
+          if (input.editId !== undefined && typeof input.editId !== 'string')
+            throw new Error('editId is invalid');
+          return json(
+            await this.undoInternal(tab, input.editId as string | undefined, 'agent', assertLease),
+          );
+        }
         if (
           [
             'workbench_browser_click',
@@ -973,46 +1989,46 @@ export class BrowserRuntime {
             'workbench_browser_select',
           ].includes(name)
         ) {
-          if (
-            typeof input.ref !== 'string' ||
-            !this.documentId ||
-            !input.ref.startsWith(`${this.documentId}:`)
-          )
-            throw new Error('元素引用已失效。请重新获取 snapshot。');
+          if (typeof input.ref !== 'string') throw new Error('ref is required');
+          const { frame, scope } = await this.resolveRef(input.ref);
+          await this.setSource(tab, 'agent', frame);
+          assertLease();
+          const point = await this.inputPoint(tab, frame, scope.localRef, assertLease);
           if (name === 'workbench_browser_click') {
-            const box = await this.bridge(
-              `globalThis.__workbenchPage.bounds(${JSON.stringify(input.ref)})`,
-            );
-            assertLease();
-            if (box.disabled) throw new Error('Element is disabled');
-            await this.page!.call('Input.dispatchMouseEvent', {
+            await tab.page.call('Input.dispatchMouseEvent', {
               type: 'mousePressed',
-              x: box.x,
-              y: box.y,
               button: 'left',
               clickCount: 1,
+              ...point,
             });
-            await this.page!.call('Input.dispatchMouseEvent', {
+            await tab.page.call('Input.dispatchMouseEvent', {
               type: 'mouseReleased',
-              x: box.x,
-              y: box.y,
               button: 'left',
               clickCount: 1,
+              ...point,
             });
           } else {
             if (typeof input.value !== 'string' || input.value.length > 20_000)
               throw new Error('value must be a string of at most 20,000 characters');
             if (name === 'workbench_browser_fill') {
-              await this.bridge(`globalThis.__workbenchPage.focus(${JSON.stringify(input.ref)})`);
+              await this.bridge(
+                tab,
+                frame,
+                `globalThis.__workbenchPage.focus(${JSON.stringify(scope.localRef)})`,
+                assertLease,
+              );
               assertLease();
-              await this.page!.call('Input.insertText', { text: input.value });
+              await tab.page.call('Input.insertText', { text: input.value });
             } else
               await this.bridge(
-                `globalThis.__workbenchPage.select(${JSON.stringify(input.ref)},${JSON.stringify(input.value)})`,
+                tab,
+                frame,
+                `globalThis.__workbenchPage.select(${JSON.stringify(scope.localRef)},${JSON.stringify(input.value)})`,
+                assertLease,
               );
           }
         } else if (name === 'workbench_browser_press') {
-          const codes: Record<string, number> = {
+          const keys: Record<string, number> = {
             Enter: 13,
             Tab: 9,
             Escape: 27,
@@ -1022,19 +2038,21 @@ export class BrowserRuntime {
             ArrowLeft: 37,
             ArrowRight: 39,
           };
-          if (typeof input.key !== 'string' || !Object.hasOwn(codes, input.key))
+          if (typeof input.key !== 'string' || !Object.hasOwn(keys, input.key))
             throw new Error('Unsupported key');
-          await this.page!.call('Input.dispatchKeyEvent', {
+          await this.setSource(tab, 'agent');
+          assertLease();
+          await tab.page.call('Input.dispatchKeyEvent', {
             type: 'rawKeyDown',
             key: input.key,
             code: input.key,
-            windowsVirtualKeyCode: codes[input.key],
+            windowsVirtualKeyCode: keys[input.key],
           });
-          await this.page!.call('Input.dispatchKeyEvent', {
+          await tab.page.call('Input.dispatchKeyEvent', {
             type: 'keyUp',
             key: input.key,
             code: input.key,
-            windowsVirtualKeyCode: codes[input.key],
+            windowsVirtualKeyCode: keys[input.key],
           });
         } else if (name === 'workbench_browser_scroll') {
           if (
@@ -1043,7 +2061,9 @@ export class BrowserRuntime {
             Math.abs(input.deltaY) > 1500
           )
             throw new Error('deltaY must be between -1500 and 1500');
-          await this.page!.call('Input.dispatchMouseEvent', {
+          await this.setSource(tab, 'agent');
+          assertLease();
+          await tab.page.call('Input.dispatchMouseEvent', {
             type: 'mouseWheel',
             x: this.width / 2,
             y: this.height / 2,
@@ -1051,7 +2071,7 @@ export class BrowserRuntime {
             deltaY: input.deltaY,
           });
         }
-        return { text: '操作已执行。请用 snapshot 或 screenshot 核对实际结果。' };
+        return { text: '操作已执行，请用 snapshot 或 screenshot 核对实际结果。' };
       } catch (error) {
         return {
           text: redactBrowserText(error instanceof Error ? error.message : error),
@@ -1060,24 +2080,31 @@ export class BrowserRuntime {
       }
     });
   }
-
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.revokeAgentControl();
+    this.recording = undefined;
     if (this.frameAckTimer) clearTimeout(this.frameAckTimer);
     this.frameAckTimer = undefined;
-    this.agentAllowed = false;
-    this.leaseGeneration++;
-    this.recording = undefined;
-    this.page?.close();
+    for (const tab of this.tabs.values()) {
+      for (const child of tab.children) child.close();
+      tab.page.close();
+    }
+    this.tabs.clear();
+    this.refs.clear();
+    this.activeTabId = '';
     try {
       await this.browser?.call('Browser.close');
     } catch {}
     this.browser?.close();
-    if (this.process?.exitCode === null) this.process.kill('SIGTERM');
-    this.page = undefined;
     this.browser = undefined;
-    this.contextId = undefined;
-    this.documentId = '';
-    this.update({ status: 'stopped', loading: false, recording: false, inspecting: false });
+    if (this.process?.exitCode === null) this.process.kill('SIGTERM');
+    this.update({
+      status: 'stopped',
+      loading: false,
+      recording: false,
+      inspecting: false,
+      selectedElement: undefined,
+    });
   }
 }

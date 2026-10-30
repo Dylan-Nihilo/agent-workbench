@@ -11,23 +11,69 @@ export interface AgentInfo {
 }
 export interface ElementRef {
   ref: string;
+  tabId?: string;
+  frameId?: string;
+  documentId?: string;
+  nodeId?: string;
   tag: string;
   role?: string;
   name: string;
   selector?: string;
   text?: string;
   value?: string;
+  shadowPath?: string[];
   bounds?: { x: number; y: number; width: number; height: number };
+}
+export interface ElementDetails extends ElementRef {
+  documentId: string;
+  textContent: string;
+  editableText: boolean;
+  editReason?: string;
+  attributes: Record<string, string>;
+  computed: Record<string, string>;
+  ancestors: ElementRef[];
+  shadowPath: string[];
+}
+export interface ElementQuery {
+  selector?: string;
+  text?: string;
+  role?: string;
+  exact?: boolean;
+  limit?: number;
+}
+export interface ElementQueryResult {
+  documentId: string;
+  elements: ElementRef[];
+  truncated: boolean;
+}
+export interface ElementEdit {
+  text?: string;
+  styles?: Record<string, string>;
+}
+export interface ElementEditResult {
+  editId: string;
+  element: ElementDetails;
+}
+export interface ElementPreview {
+  editId: string;
+  tabId: string;
+  frameId: string;
+  documentId: string;
+  nodeId: string;
+  changes: ElementEdit;
 }
 export interface RecordedStep {
   id: string;
-  kind: 'navigate' | 'click' | 'fill' | 'select' | 'key' | 'scroll';
+  kind: 'navigate' | 'click' | 'fill' | 'select' | 'key' | 'scroll' | 'edit' | 'undo';
   description: string;
   timestamp: number;
   url: string;
   source: 'human' | 'agent';
   target?: Partial<ElementRef>;
   value?: string;
+  tabId?: string;
+  frameId?: string;
+  editId?: string;
 }
 export interface Recording {
   id: string;
@@ -37,9 +83,19 @@ export interface Recording {
   steps: RecordedStep[];
   summary?: string;
 }
+export interface BrowserTab {
+  id: string;
+  title: string;
+  url: string;
+  loading: boolean;
+  canGoBack: boolean;
+  canGoForward: boolean;
+}
 export interface BrowserState {
   status: 'missing' | 'starting' | 'ready' | 'error' | 'stopped';
   engine: 'browseros';
+  tabs: BrowserTab[];
+  activeTabId?: string;
   binaryPath?: string;
   url: string;
   title: string;
@@ -49,14 +105,16 @@ export interface BrowserState {
   recording: boolean;
   inspecting: boolean;
   selectedElement?: ElementRef;
+  previewEdits?: ElementPreview[];
   error?: string;
 }
 export interface BrowserFrame {
   data: string;
   width: number;
   height: number;
+  tabId?: string;
 }
-export type BrowserInput =
+export type BrowserInput = (
   | {
       type: 'mouse';
       action: 'move' | 'down' | 'up';
@@ -77,7 +135,8 @@ export type BrowserInput =
       text?: string;
     }
   | { type: 'text'; text: string }
-  | { type: 'resize'; width: number; height: number };
+  | { type: 'resize'; width: number; height: number }
+) & { tabId?: string };
 export interface BrowserTool {
   name: string;
   description: string;
@@ -144,6 +203,8 @@ export interface Conversation {
   updatedAt: number;
   messages: ChatMessage[];
   agentSessionId?: string;
+  agentToolsFingerprint?: string;
+  previousAgentSessionIds?: string[];
   workspace?: string;
   remoteChatId?: string;
 }

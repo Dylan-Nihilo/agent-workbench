@@ -37,6 +37,8 @@ import type {
   BrowserState,
   ChatMessage,
   Conversation,
+  ElementDetails,
+  ElementEdit,
   ElementRef,
   FeishuState,
   PendingAgentRequest,
@@ -48,6 +50,7 @@ import type {
 const emptyBrowser: BrowserState = {
   status: 'starting',
   engine: 'browseros',
+  tabs: [],
   url: '',
   title: '',
   loading: false,
@@ -89,6 +92,13 @@ function ToolActivity({ tools }: { tools: NonNullable<ChatMessage['tools']> }) {
       key: '键盘操作',
       logs: '读取页面日志',
       inspect: '检查元素',
+      query: '查找元素',
+      edit: '预览元素修改',
+      undo: '撤销页面修改',
+      tabs: '查看标签页',
+      new_tab: '新建标签页',
+      switch_tab: '切换标签页',
+      close_tab: '关闭标签页',
     };
     return (
       Object.entries(names).find(([key]) => raw.includes(key))?.[1] ||
@@ -126,26 +136,44 @@ function Modal({
   onClose: () => void;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
+  const [phase, setPhase] = useState<'entering' | 'open' | 'closing'>('entering');
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => {
     ref.current?.showModal();
-    return () => ref.current?.close();
+    if (ref.current) void ref.current.offsetWidth;
+    const frame = requestAnimationFrame(() => setPhase('open'));
+    return () => {
+      cancelAnimationFrame(frame);
+      clearTimeout(closeTimer.current);
+      ref.current?.close();
+    };
   }, []);
+  const close = () => {
+    if (phase === 'closing') return;
+    setPhase('closing');
+    const duration = matchMedia('(prefers-reduced-motion: reduce)').matches
+      ? 0
+      : parseFloat(
+          getComputedStyle(document.documentElement).getPropertyValue('--modal-close-dur'),
+        ) || 150;
+    closeTimer.current = setTimeout(onClose, duration);
+  };
   return (
     <dialog
-      className="settings-dialog"
+      className={`settings-dialog t-modal ${phase === 'open' ? 'is-open' : phase === 'closing' ? 'is-closing' : ''}`}
       ref={ref}
       onCancel={(event) => {
         event.preventDefault();
-        onClose();
+        close();
       }}
       onClick={(event) => {
-        if (event.target === ref.current) onClose();
+        if (event.target === ref.current) close();
       }}
     >
       <div className="dialog-content">
         <div className="dialog-heading">
           <h2>{title}</h2>
-          <button className="icon-button" aria-label="关闭设置" onClick={onClose}>
+          <button className="icon-button" aria-label="关闭设置" onClick={close}>
             <X size={18} />
           </button>
         </div>
@@ -167,6 +195,7 @@ export default function App() {
   const [liveSteps, setLiveSteps] = useState<RecordedStep[]>([]);
   const [draft, setDraft] = useState('');
   const [selected, setSelected] = useState<ElementRef>();
+  const [selectedEdit, setSelectedEdit] = useState<ElementEdit>();
   const [sidebar, setSidebar] = useState(true);
   const [browserVisible, setBrowserVisible] = useState(false);
   const [browserWidth, setBrowserWidth] = useState(620);
@@ -188,6 +217,7 @@ export default function App() {
   const scroll = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const lastFrame = useRef<BrowserFrame | undefined>(undefined);
+  const activeBrowserTab = useRef<string | undefined>(undefined);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const conversation = conversations.find((item) => item.id === conversationId);
   const messages = conversation?.messages || [];
@@ -233,9 +263,12 @@ export default function App() {
     let feishuUpdated = false;
     let requestsUpdated = false;
     const handle = (event: AppEvent) => {
-      if (event.type === 'browser:frame') lastFrame.current = event.frame;
-      else if (event.type === 'browser:state') {
+      if (event.type === 'browser:frame') {
+        if (!event.frame.tabId || event.frame.tabId === activeBrowserTab.current)
+          lastFrame.current = event.frame;
+      } else if (event.type === 'browser:state') {
         browserUpdated = true;
+        activeBrowserTab.current = event.state.activeTabId;
         setBrowser((previous) => {
           if (event.state.recording && !previous.recording) setLiveSteps([]);
           return event.state;
@@ -249,7 +282,7 @@ export default function App() {
         });
       else if (event.type === 'browser:selected') {
         setSelected(event.element);
-        composer.current?.focus();
+        setSelectedEdit(undefined);
       } else if (event.type === 'recording:saved')
         setRecordings((previous) => [
           event.recording,
@@ -279,7 +312,7 @@ export default function App() {
               {
                 starting: '正在连接本机 Agent',
                 thinking: '正在思考',
-                working: '正在处理页面',
+                working: '正在执行任务',
                 waiting: '等待你的确认',
                 idle: '',
               }[agentEvent.status],
@@ -357,7 +390,10 @@ export default function App() {
         lastFrame.current ??= snapshot.browserFrame;
         setSettings(snapshot.settings);
         setAgents(snapshot.agents);
-        if (!browserUpdated) setBrowser(snapshot.browser);
+        if (!browserUpdated) {
+          activeBrowserTab.current = snapshot.browser.activeTabId;
+          setBrowser(snapshot.browser);
+        }
         if (!feishuUpdated) setFeishu(snapshot.feishu);
         if (!requestsUpdated) setPendingRequests(snapshot.pendingRequests ?? []);
         setConversations(snapshot.conversations);
@@ -381,7 +417,10 @@ export default function App() {
       composer.current.style.height = `${Math.min(160, composer.current.scrollHeight)}px`;
     }
   }, [draft]);
-  useEffect(() => setSelected(undefined), [browser.url]);
+  useEffect(() => {
+    setSelected(undefined);
+    setSelectedEdit(undefined);
+  }, [browser.url, browser.activeTabId]);
   useEffect(() => {
     if (!panels.current) return;
     const observer = new ResizeObserver(([entry]) => setPanelWidth(entry.contentRect.width));
@@ -403,7 +442,22 @@ export default function App() {
   useEffect(() => {
     const listener = (event: KeyboardEvent) => {
       if (!event.metaKey && !event.ctrlKey) return;
-      if ((event.target as HTMLElement)?.classList.contains('browser-keyboard')) return;
+      if (event.key.toLowerCase() === 't') {
+        event.preventDefault();
+        setBrowserVisible(true);
+        document.querySelector<HTMLButtonElement>('button[aria-label="新建标签页"]')?.click();
+        return;
+      }
+      if (event.key.toLowerCase() === 'w' && browserVisible && browser.activeTabId) {
+        event.preventDefault();
+        document.querySelector<HTMLButtonElement>('.browser-tab.is-active .tab-close')?.click();
+        return;
+      }
+      if (
+        (event.target as HTMLElement)?.classList.contains('browser-keyboard') &&
+        event.key.toLowerCase() !== 'l'
+      )
+        return;
       if (event.key === 'n') {
         event.preventDefault();
         void newConversation();
@@ -423,11 +477,11 @@ export default function App() {
     };
     window.addEventListener('keydown', listener);
     return () => window.removeEventListener('keydown', listener);
-  }, [newConversation]);
+  }, [newConversation, action, browserVisible, browser.activeTabId]);
   const send = async () => {
     if (!draft.trim() || busy) return;
     const context = selected
-      ? `用户选中了网页元素：${JSON.stringify(selected)}\n当前页面：${pageSource(browser.url)}`
+      ? `用户选中了网页元素：${JSON.stringify(selected)}\n页面预览修改（仅当前DOM，不代表源码已保存）：${JSON.stringify(selectedEdit ?? null)}\n当前页面：${pageSource(browser.url)}\n请先核实当前项目与此页面的对应关系；若用户要求改源码，定位真实组件、修改文件并在浏览器验证。不要把DOM预览当成源码修改。`
       : undefined;
     const result = await action<{ conversationId: string }>('conversation:send', {
       id: conversationId,
@@ -438,6 +492,7 @@ export default function App() {
       setConversationId(result.conversationId);
       setDraft('');
       setSelected(undefined);
+      setSelectedEdit(undefined);
       stickToBottom.current = true;
     }
   };
@@ -482,83 +537,81 @@ export default function App() {
     <div
       className={`app-shell ${sidebar ? '' : 'sidebar-collapsed'} ${browserVisible ? '' : 'browser-collapsed'}`}
     >
-      {sidebar && (
-        <aside className="sidebar">
-          <div className="window-drag sidebar-top">
-            <button
-              className="icon-button"
-              title="收起侧栏 · ⌘B"
-              aria-label="收起侧栏"
-              onClick={() => setSidebar(false)}
-            >
-              <PanelLeftClose size={17} />
-            </button>
-          </div>
-          <div className="brand">
-            <span className="brand-mark">
-              <Command size={18} strokeWidth={1.7} />
-            </span>
-            <span>Workbench</span>
-          </div>
-          <button className="new-conversation" onClick={() => void newConversation()}>
-            <Plus size={17} />
-            <span>新对话</span>
-            <kbd>⌘N</kbd>
-          </button>
+      <aside className="sidebar" aria-hidden={!sidebar} inert={!sidebar}>
+        <div className="window-drag sidebar-top">
           <button
-            className="workspace-selector"
-            onClick={() => void workspace()}
-            title={settings.workspace}
+            className="icon-button"
+            title="收起侧栏 · ⌘B"
+            aria-label="收起侧栏"
+            onClick={() => setSidebar(false)}
           >
-            <FolderOpen size={16} />
-            <span>{basename(settings.workspace)}</span>
-            <ChevronDown size={13} />
+            <PanelLeftClose size={17} />
           </button>
-          <div className="sidebar-section-label">对话</div>
-          <nav className="conversation-list" aria-label="对话列表">
-            {conversations.length ? (
-              conversations.map((item) => (
-                <button
-                  key={item.id}
-                  className={`conversation-link ${item.id === conversationId ? 'active' : ''}`}
-                  onClick={() => {
-                    setConversationId(item.id);
-                    setSelected(undefined);
-                    stickToBottom.current = true;
-                  }}
-                  title={item.title}
-                >
-                  {item.messages.some((message) => message.status === 'streaming') ? (
-                    <Loader2 size={14} className="spin" />
-                  ) : (
-                    <MessageSquare size={14} />
-                  )}
-                  <span>{item.title}</span>
-                </button>
-              ))
-            ) : (
-              <p className="sidebar-empty">新的对话会保存在这里</p>
-            )}
-          </nav>
-          <div className="sidebar-bottom">
-            <button className="sidebar-connection" onClick={() => setSettingsTab('feishu')}>
-              <Link2 size={16} />
-              <span>飞书</span>
-              <span className={`connection-caption ${connected ? 'connected' : ''}`}>
-                {connected ? '已连接' : feishu.status === 'connected' ? '待配对' : '连接'}
-              </span>
-            </button>
-            <button className="sidebar-settings" onClick={() => setSettingsTab('agent')}>
-              <Settings2 size={16} />
-              <span>设置</span>
-            </button>
-            <div className="local-note">
-              <span className="status-dot online" />
-              <span>本机工作区</span>
-            </div>
+        </div>
+        <div className="brand">
+          <span className="brand-mark">
+            <Command size={18} strokeWidth={1.7} />
+          </span>
+          <span>Workbench</span>
+        </div>
+        <button className="new-conversation" onClick={() => void newConversation()}>
+          <Plus size={17} />
+          <span>新对话</span>
+          <kbd>⌘N</kbd>
+        </button>
+        <button
+          className="workspace-selector"
+          onClick={() => void workspace()}
+          title={settings.workspace}
+        >
+          <FolderOpen size={16} />
+          <span>{basename(settings.workspace)}</span>
+          <ChevronDown size={13} />
+        </button>
+        <div className="sidebar-section-label">对话</div>
+        <nav className="conversation-list" aria-label="对话列表">
+          {conversations.length ? (
+            conversations.map((item) => (
+              <button
+                key={item.id}
+                className={`conversation-link ${item.id === conversationId ? 'active' : ''}`}
+                onClick={() => {
+                  setConversationId(item.id);
+                  setSelected(undefined);
+                  stickToBottom.current = true;
+                }}
+                title={item.title}
+              >
+                {item.messages.some((message) => message.status === 'streaming') ? (
+                  <Loader2 size={14} className="spin" />
+                ) : (
+                  <MessageSquare size={14} />
+                )}
+                <span>{item.title}</span>
+              </button>
+            ))
+          ) : (
+            <p className="sidebar-empty">新的对话会保存在这里</p>
+          )}
+        </nav>
+        <div className="sidebar-bottom">
+          <button className="sidebar-connection" onClick={() => setSettingsTab('feishu')}>
+            <Link2 size={16} />
+            <span>飞书</span>
+            <span className={`connection-caption ${connected ? 'connected' : ''}`}>
+              {connected ? '已连接' : feishu.status === 'connected' ? '待配对' : '连接'}
+            </span>
+          </button>
+          <button className="sidebar-settings" onClick={() => setSettingsTab('agent')}>
+            <Settings2 size={16} />
+            <span>设置</span>
+          </button>
+          <div className="local-note">
+            <span className="status-dot online" />
+            <span>本机工作区</span>
           </div>
-        </aside>
-      )}
+        </div>
+      </aside>
       <main className="work-area">
         <header className="topbar window-drag">
           <div className={`topbar-title ${sidebar ? '' : 'with-traffic-lights'}`}>
@@ -575,11 +628,24 @@ export default function App() {
           </div>
           <div className="topbar-actions">
             <button
-              className={`connection-button ${connected ? 'is-connected' : ''}`}
-              onClick={() => setSettingsTab('feishu')}
+              className="connection-button local-agent-status"
+              onClick={() => setSettingsTab('agent')}
             >
-              <Link2 size={14} />
-              <span>{connected ? '飞书已连接' : '连接飞书'}</span>
+              <span
+                className={`status-dot ${currentAgent?.available && currentAgent.authentication === 'ready' ? 'online' : ''}`}
+              />
+              <span>{currentAgent?.name || '本机 Agent'}</span>
+              <span className="agent-status-caption">
+                {currentAgent?.available
+                  ? currentAgent.authentication === 'missing'
+                    ? '需要登录'
+                    : currentAgent.authentication === 'ready'
+                      ? '已连接'
+                      : '待验证'
+                  : currentAgent?.path
+                    ? '启动异常'
+                    : '未检测到'}
+              </span>
             </button>
             <span className="toolbar-divider" />
             <button
@@ -633,6 +699,17 @@ export default function App() {
                     >
                       <Globe2 size={16} />
                       <span>查看当前页面</span>
+                      <ArrowUpRight size={14} />
+                    </button>
+                    <button
+                      disabled={browser.status !== 'ready'}
+                      onClick={() => {
+                        setBrowserVisible(true);
+                        void action('browser:inspect', { enabled: true });
+                      }}
+                    >
+                      <MousePointer2 size={16} />
+                      <span>选取并修改元素</span>
                       <ArrowUpRight size={14} />
                     </button>
                     <button
@@ -839,7 +916,12 @@ export default function App() {
                       <button
                         className="send-button"
                         aria-label="发送任务"
-                        disabled={!loaded || !draft.trim() || !currentAgent?.available}
+                        disabled={
+                          !loaded ||
+                          !draft.trim() ||
+                          !currentAgent?.available ||
+                          currentAgent.authentication === 'missing'
+                        }
                         onClick={() => void send()}
                       >
                         <ArrowUp size={18} />
@@ -863,7 +945,7 @@ export default function App() {
             </div>
           </section>
           <aside
-            className={`browser-drawer ${browserVisible ? 'is-open' : ''}`}
+            className={`browser-drawer t-resize ${browserVisible ? 'is-open' : ''}`}
             aria-label="浏览器侧栏"
             aria-hidden={!browserVisible}
             inert={!browserVisible}
@@ -926,6 +1008,18 @@ export default function App() {
               onAnalyze={(id) => void analyze(id)}
               onClose={() => {
                 setBrowserVisible(false);
+                composer.current?.focus();
+              }}
+              onSourceRequest={(element: ElementDetails, changes?: ElementEdit) => {
+                setSelected(element);
+                setSelectedEdit(changes);
+                setDraft(
+                  (previous) =>
+                    previous.trim() ||
+                    (changes
+                      ? '请将选中元素的页面预览改动应用到当前项目源码，并验证页面。'
+                      : '请在当前项目源码中定位选中的元素，先说明对应组件和可修改的位置。'),
+                );
                 composer.current?.focus();
               }}
             />
@@ -1001,10 +1095,9 @@ export default function App() {
                       </div>
                       <div>
                         <strong>{agent.name}</strong>
-                        <p>{agent.available ? agent.version || '已安装' : '未检测到安装'}</p>
-                        {agent.available && agent.path && (
-                          <small title={agent.path}>{agent.path}</small>
-                        )}
+                        <p>{agent.path ? agent.version || '已找到可执行文件' : '未检测到安装'}</p>
+                        {agent.path && <small title={agent.path}>{agent.path}</small>}
+                        {agent.detail && <p className="agent-detail">{agent.detail}</p>}
                       </div>
                       <span
                         className={`small-badge ${agent.available && agent.supported ? 'success' : ''}`}
@@ -1013,9 +1106,13 @@ export default function App() {
                           ? agent.supported
                             ? agent.authentication === 'missing'
                               ? '需要登录'
-                              : '可使用'
+                              : agent.authentication === 'unknown'
+                                ? '登录待验证'
+                                : '可使用'
                             : '已检测'
-                          : '未安装'}
+                          : agent.path
+                            ? '启动异常'
+                            : '未安装'}
                       </span>
                     </div>
                   ))}

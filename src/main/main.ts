@@ -17,6 +17,8 @@ import type {
   BrowserInput,
   ChatMessage,
   Conversation,
+  ElementEdit,
+  ElementQuery,
   FeishuMessage,
   PendingAgentRequest,
   Recording,
@@ -49,6 +51,9 @@ const readOnlyBrowserTools = new Set([
   'workbench_browser_snapshot',
   'workbench_browser_screenshot',
   'workbench_browser_diagnostics',
+  'workbench_browser_tabs',
+  'workbench_browser_query',
+  'workbench_browser_inspect',
 ]);
 let quitting = false;
 
@@ -142,8 +147,19 @@ async function runTurn(
     (agent) => agent.id === store.data.settings.agent && agent.available && agent.supported,
   );
   if (!info?.path) throw new Error('请先安装并登录 Codex，再刷新 Agent 列表');
+  if (info.authentication === 'missing')
+    throw new Error('Codex 尚未登录，请在终端执行 codex login 后刷新。');
   if (!text.trim()) throw new Error('请输入任务');
   if (!conversation.messages.length) conversation.title = text.trim().split('\n')[0].slice(0, 32);
+  const visibleHistory = conversation.messages.length
+    ? JSON.stringify(
+        conversation.messages.map((message) => ({
+          role: message.role,
+          text: message.text,
+          status: message.status,
+        })),
+      )
+    : undefined;
   const user: ChatMessage = {
     id: randomUUID(),
     role: 'user',
@@ -169,11 +185,17 @@ async function runTurn(
   });
   emit({ type: 'conversation:updated', conversation });
   let session = sessions.get(conversation.id);
+  if (session?.isClosed) {
+    sessions.delete(conversation.id);
+    session = undefined;
+  }
   if (!session) {
     session = new CodexSession({
       workspace: store.data.settings.workspace,
       executablePath: info.path,
       sessionId: conversation.agentSessionId,
+      sessionToolsFingerprint: conversation.agentToolsFingerprint,
+      historyForToolUpgrade: visibleHistory,
       tools: browser.getTools(),
       callTool: async (name: string, args: unknown) => {
         if (!active || active.conversationId !== conversation.id)
@@ -183,6 +205,8 @@ async function runTurn(
         return browser.callTool(name, args);
       },
       onEvent: (event: AgentEvent) => {
+        if (!active || active.session !== session || active.conversationId !== conversation.id)
+          return;
         const current = conversation.messages.find((message) => message.id === active?.messageId);
         if (current) onAgentEvent(conversation.id, current, event);
       },
@@ -221,20 +245,31 @@ async function runTurn(
       ? new Error('本轮包含受保护的信息，请在 Workbench 查看执行详情。')
       : error;
   } finally {
+    browser.revokeAgentControl();
     if (session.sessionId) conversation.agentSessionId = session.sessionId;
-    active = undefined;
-    await store.save();
-    emit({ type: 'conversation:updated', conversation });
-    emit({
-      type: 'agent:event',
-      conversationId: conversation.id,
-      messageId: assistant.id,
-      event: { type: 'status', status: 'idle' },
-    });
+    conversation.agentToolsFingerprint = session.toolsFingerprint;
+    if (session.replacedSessionId) {
+      conversation.previousAgentSessionIds = [
+        ...new Set([...(conversation.previousAgentSessionIds ?? []), session.replacedSessionId]),
+      ];
+    }
+    try {
+      await store.save();
+    } finally {
+      active = undefined;
+      emit({ type: 'conversation:updated', conversation });
+      emit({
+        type: 'agent:event',
+        conversationId: conversation.id,
+        messageId: assistant.id,
+        event: { type: 'status', status: 'idle' },
+      });
+    }
   }
 }
 async function stopTurn() {
   if (!active) return;
+  browser.revokeAgentControl();
   await active.session.interrupt();
 }
 function startTurn(conversation: Conversation, text: string, context?: string, readonly = false) {
@@ -409,6 +444,48 @@ async function invoke(action: string, payload: unknown) {
     case 'browser:start':
       await browser.start();
       return browser.getState();
+    case 'browser:tabs':
+      return browser.listTabs();
+    case 'browser:new-tab': {
+      const data = payload === undefined ? {} : record(payload);
+      return browser.newTab(data.url === undefined ? undefined : string(data.url, 4000));
+    }
+    case 'browser:switch-tab':
+      return browser.switchTab(string(record(payload).id, 200));
+    case 'browser:close-tab':
+      return browser.closeTab(string(record(payload).id, 200));
+    case 'browser:query': {
+      const data = record(payload);
+      const query: ElementQuery = {
+        selector: data.selector === undefined ? undefined : string(data.selector, 2000),
+        text: data.text === undefined ? undefined : string(data.text, 2000),
+        role: data.role === undefined ? undefined : string(data.role, 200),
+        exact: data.exact === true,
+        limit: 30,
+      };
+      return browser.queryElements(query);
+    }
+    case 'browser:element':
+      return browser.selectElement(string(record(payload).ref, 1500));
+    case 'browser:element-details':
+      return browser.getElementDetails(string(record(payload).ref, 1500));
+    case 'browser:edit': {
+      const data = record(payload);
+      const changes: ElementEdit = {};
+      if (data.text !== undefined) changes.text = string(data.text, 20_000);
+      if (data.styles !== undefined) {
+        const styles = record(data.styles);
+        if (Object.keys(styles).length > 30) throw new Error('一次修改的样式过多');
+        changes.styles = Object.fromEntries(
+          Object.entries(styles).map(([key, value]) => [string(key, 80), string(value, 500)]),
+        );
+      }
+      return browser.editElement(string(data.ref, 1500), changes);
+    }
+    case 'browser:undo': {
+      const data = payload === undefined ? {} : record(payload);
+      return browser.undoEdit(data.editId === undefined ? undefined : string(data.editId, 1500));
+    }
     case 'browser:navigate':
       await browser.navigate(string(record(payload).url, 4000));
       return browser.getState();
@@ -568,7 +645,7 @@ async function launch() {
     minWidth: 1060,
     minHeight: 700,
     title: 'Agent Workbench',
-    backgroundColor: '#f5f4f0',
+    backgroundColor: '#ffffff',
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 20, y: 21 },
     show: false,

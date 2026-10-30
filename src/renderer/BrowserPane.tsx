@@ -9,7 +9,9 @@ import {
   Globe2,
   Loader2,
   MousePointer2,
+  PanelBottom,
   Play,
+  Plus,
   RefreshCw,
   Square,
   X,
@@ -18,9 +20,12 @@ import type {
   BrowserFrame,
   BrowserInput,
   BrowserState,
+  ElementDetails,
+  ElementEdit,
   RecordedStep,
   Recording,
 } from '../shared/types';
+import { ElementInspector } from './ElementInspector';
 
 interface Props {
   state: BrowserState;
@@ -30,6 +35,7 @@ interface Props {
   onOpenSettings: () => void;
   onAnalyze: (id: string) => void;
   onClose: () => void;
+  onSourceRequest: (element: ElementDetails, changes?: ElementEdit) => void;
   initialFrame?: BrowserFrame;
 }
 function modifiers(event: {
@@ -53,13 +59,19 @@ export function BrowserPane({
   onOpenSettings,
   onAnalyze,
   onClose,
+  onSourceRequest,
   initialFrame,
 }: Props) {
   const [url, setUrl] = useState(state.url);
   const [mode, setMode] = useState<'page' | 'recordings'>('page');
   const [recordingId, setRecordingId] = useState<string>();
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [frameLoading, setFrameLoading] = useState(!initialFrame?.data);
+  const [viewportPending, setViewportPending] = useState(false);
+  const [tabBusy, setTabBusy] = useState(false);
   const image = useRef<HTMLImageElement>(null);
   const lastFrame = useRef(initialFrame?.data || '');
+  const activeTab = useRef(state.activeTabId);
   const surface = useRef<HTMLDivElement>(null);
   const keyboard = useRef<HTMLTextAreaElement>(null);
   const address = useRef<HTMLInputElement>(null);
@@ -68,23 +80,63 @@ export function BrowserPane({
     height: initialFrame?.height || 720,
   });
   const composing = useRef(false);
+  const compositionTab = useRef<string | undefined>(undefined);
   const compositionCommit = useRef<{ value: string; time: number } | undefined>(undefined);
   const pointerFrame = useRef<number>(0);
   const busy = state.status === 'starting' || state.loading;
   const ready = state.status === 'ready';
   const recording = recordings.find((item) => item.id === recordingId) || recordings[0];
   const sendInput = (input: BrowserInput) => {
-    if (ready) void window.workbench.invoke('browser:input', input).catch(() => {});
+    if (input.type === 'mouse' || input.type === 'wheel') {
+      const bounds = surface.current?.getBoundingClientRect();
+      if (
+        !bounds ||
+        Math.abs(viewport.current.width - Math.floor(bounds.width)) > 1 ||
+        Math.abs(viewport.current.height - Math.floor(bounds.height)) > 1
+      )
+        return;
+    }
+    if (ready && !frameLoading && !viewportPending)
+      void window.workbench
+        .invoke('browser:input', { ...input, tabId: input.tabId ?? activeTab.current })
+        .catch(() => {});
   };
 
   useEffect(() => {
     if (document.activeElement !== address.current)
       setUrl(state.url === 'about:blank' ? '' : state.url);
   }, [state.url]);
+  useEffect(() => {
+    if (state.selectedElement) {
+      setInspectorOpen(true);
+      setMode('page');
+    }
+  }, [state.selectedElement?.ref]);
+  useEffect(() => {
+    if (state.activeTabId !== activeTab.current) {
+      activeTab.current = state.activeTabId;
+      lastFrame.current = '';
+      image.current?.removeAttribute('src');
+      setFrameLoading(true);
+    }
+  }, [state.activeTabId]);
   useEffect(
     () =>
       window.workbench.onEvent((event) => {
+        if (event.type === 'browser:state' && event.state.activeTabId !== activeTab.current) {
+          activeTab.current = event.state.activeTabId;
+          lastFrame.current = '';
+          image.current?.removeAttribute('src');
+          setFrameLoading(true);
+        }
         if (event.type === 'browser:frame') {
+          if (event.frame.tabId && event.frame.tabId !== activeTab.current) return;
+          if (!event.frame.data) {
+            lastFrame.current = '';
+            image.current?.removeAttribute('src');
+            setFrameLoading(true);
+            return;
+          }
           viewport.current = { width: event.frame.width, height: event.frame.height };
           lastFrame.current = event.frame.data.startsWith('data:')
             ? event.frame.data
@@ -100,6 +152,10 @@ export function BrowserPane({
     const observer = new ResizeObserver((entries) => {
       clearTimeout(timer);
       const bounds = entries[0].contentRect;
+      setViewportPending(
+        Math.abs(viewport.current.width - Math.floor(bounds.width)) > 1 ||
+          Math.abs(viewport.current.height - Math.floor(bounds.height)) > 1,
+      );
       timer = setTimeout(() => {
         if (bounds.width > 100 && bounds.height > 100)
           void window.workbench
@@ -123,10 +179,11 @@ export function BrowserPane({
       if (!ready) return;
       event.preventDefault();
       const bounds = node.getBoundingClientRect();
+      const scale = viewport.current.width / bounds.width;
       sendInput({
         type: 'wheel',
-        x: ((event.clientX - bounds.left) * viewport.current.width) / bounds.width,
-        y: ((event.clientY - bounds.top) * viewport.current.height) / bounds.height,
+        x: (event.clientX - bounds.left) * scale,
+        y: (event.clientY - bounds.top) * scale,
         deltaX: event.deltaX,
         deltaY: event.deltaY,
         modifiers: modifiers(event),
@@ -134,23 +191,31 @@ export function BrowserPane({
     };
     node.addEventListener('wheel', wheel, { passive: false });
     return () => node.removeEventListener('wheel', wheel);
-  }, [ready, mode]);
+  }, [ready, frameLoading, viewportPending, mode]);
 
   const point = (event: React.MouseEvent<HTMLDivElement>) => {
     const bounds = event.currentTarget.getBoundingClientRect();
+    const scale = viewport.current.width / bounds.width;
     return {
-      x: ((event.clientX - bounds.left) * viewport.current.width) / bounds.width,
-      y: ((event.clientY - bounds.top) * viewport.current.height) / bounds.height,
+      x: (event.clientX - bounds.left) * scale,
+      y: (event.clientY - bounds.top) * scale,
     };
   };
   const pointer = (event: React.MouseEvent<HTMLDivElement>, action: 'move' | 'down' | 'up') => {
-    if (!ready || event.target === keyboard.current) return;
+    if (!ready || frameLoading || viewportPending || event.target === keyboard.current) return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    if (
+      Math.abs(viewport.current.width - Math.floor(bounds.width)) > 1 ||
+      Math.abs(viewport.current.height - Math.floor(bounds.height)) > 1
+    )
+      return;
     if (action === 'down') {
       event.preventDefault();
       keyboard.current?.focus({ preventScroll: true });
     }
     const data: BrowserInput = {
       type: 'mouse',
+      tabId: activeTab.current,
       action,
       ...point(event),
       button: event.button === 2 ? 'right' : event.button === 1 ? 'middle' : 'left',
@@ -171,6 +236,8 @@ export function BrowserPane({
     )
       return;
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'v') return;
+    if ((event.metaKey || event.ctrlKey) && ['l', 't', 'w'].includes(event.key.toLowerCase()))
+      return;
     if (event.key === 'Tab' && event.shiftKey && event.ctrlKey) return;
     event.preventDefault();
     sendInput({
@@ -192,6 +259,7 @@ export function BrowserPane({
   };
   const navigate = async (event: React.FormEvent) => {
     event.preventDefault();
+    if (tabBusy || !ready) return;
     const target = url.trim();
     if (!target) return;
     await onAction('browser:navigate', { url: target });
@@ -207,6 +275,28 @@ export function BrowserPane({
     } else {
       setMode('page');
       await onAction('recording:start');
+    }
+  };
+  const newTab = async () => {
+    if (tabBusy) return;
+    setTabBusy(true);
+    setMode('page');
+    setUrl('');
+    address.current?.focus();
+    try {
+      await onAction('browser:new-tab');
+    } finally {
+      setTabBusy(false);
+    }
+  };
+  const changeTab = async (action: 'browser:switch-tab' | 'browser:close-tab', id: string) => {
+    if (tabBusy) return;
+    setTabBusy(true);
+    setMode('page');
+    try {
+      await onAction(action, { id });
+    } finally {
+      setTabBusy(false);
     }
   };
   return (
@@ -226,6 +316,54 @@ export function BrowserPane({
           <X size={16} />
         </button>
       </header>
+      <div className="browser-tabbar" role="tablist" aria-label="网页标签">
+        {(state.tabs ?? []).map((tab, index) => (
+          <div
+            className={`browser-tab ${tab.id === state.activeTabId ? 'is-active' : ''}`}
+            key={tab.id}
+          >
+            <button
+              role="tab"
+              aria-selected={tab.id === state.activeTabId}
+              aria-label={tab.title || '新标签页'}
+              tabIndex={tab.id === state.activeTabId ? 0 : -1}
+              disabled={tabBusy}
+              title={tab.url === 'about:blank' ? '新标签页' : tab.url}
+              onClick={() => {
+                setMode('page');
+                void changeTab('browser:switch-tab', tab.id);
+              }}
+              onKeyDown={(event) => {
+                const offset = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0;
+                if (!offset) return;
+                event.preventDefault();
+                const next = state.tabs[(index + offset + state.tabs.length) % state.tabs.length];
+                void changeTab('browser:switch-tab', next.id);
+              }}
+            >
+              {tab.loading ? <Loader2 size={12} className="spin" /> : <Globe2 size={12} />}
+              <span>{tab.title || '新标签页'}</span>
+            </button>
+            <button
+              className="tab-close"
+              aria-label={`关闭标签 ${tab.title || '新标签页'}`}
+              disabled={tabBusy}
+              onClick={() => void changeTab('browser:close-tab', tab.id)}
+            >
+              <X size={12} />
+            </button>
+          </div>
+        ))}
+        <button
+          className="icon-button new-tab-button"
+          aria-label="新建标签页"
+          title="新建标签页 ⌘T"
+          disabled={!ready || tabBusy}
+          onClick={() => void newTab()}
+        >
+          <Plus size={15} />
+        </button>
+      </div>
       <div className="browser-navigation">
         <div className="nav-buttons">
           <button
@@ -267,7 +405,7 @@ export function BrowserPane({
             onFocus={(event) => event.target.select()}
             spellCheck={false}
           />
-          <button aria-label="打开网页" title="打开网页" type="submit">
+          <button aria-label="打开网页" title="打开网页" type="submit" disabled={!ready || tabBusy}>
             <ArrowUpRight size={14} />
           </button>
         </form>
@@ -286,10 +424,23 @@ export function BrowserPane({
         </div>
         <div className="tool-buttons">
           <button
+            className={`icon-button ${inspectorOpen ? 'is-on' : ''}`}
+            title="元素检查器"
+            aria-label="元素检查器"
+            disabled={!ready}
+            onClick={() => {
+              setMode('page');
+              setInspectorOpen((value) => !value);
+            }}
+          >
+            <PanelBottom size={15} />
+          </button>
+          <button
             className={`subtle-button ${state.inspecting ? 'selected' : ''}`}
             disabled={!ready}
             onClick={() => {
               setMode('page');
+              setInspectorOpen(true);
               void onAction('browser:inspect', { enabled: !state.inspecting });
             }}
           >
@@ -311,7 +462,7 @@ export function BrowserPane({
           {state.inspecting && (
             <div className="inspect-tip">
               <MousePointer2 size={13} />
-              点击页面元素，将它带入对话
+              点击元素，查看定位与可修改属性
               <button
                 aria-label="取消选取"
                 onClick={() => void onAction('browser:inspect', { enabled: false })}
@@ -336,7 +487,22 @@ export function BrowserPane({
               className="browser-frame"
               alt={state.title ? `${state.title}，可交互网页` : 'BrowserOS neo 页面'}
               draggable={false}
+              onLoad={() => {
+                setFrameLoading(false);
+                const bounds = surface.current?.getBoundingClientRect();
+                if (bounds)
+                  setViewportPending(
+                    Math.abs(viewport.current.width - Math.floor(bounds.width)) > 1 ||
+                      Math.abs(viewport.current.height - Math.floor(bounds.height)) > 1,
+                  );
+              }}
             />
+            {ready && (frameLoading || viewportPending) && (
+              <div className="frame-loading">
+                <Loader2 size={19} className="spin" />
+                <span>正在显示页面</span>
+              </div>
+            )}
             <textarea
               ref={keyboard}
               className="browser-keyboard"
@@ -348,11 +514,12 @@ export function BrowserPane({
               onKeyUp={(event) => key(event, 'up')}
               onCompositionStart={() => {
                 composing.current = true;
+                compositionTab.current = activeTab.current;
               }}
               onCompositionEnd={(event) => {
                 composing.current = false;
                 compositionCommit.current = { value: event.data, time: Date.now() };
-                sendInput({ type: 'text', text: event.data });
+                sendInput({ type: 'text', text: event.data, tabId: compositionTab.current });
                 event.currentTarget.value = '';
               }}
               onInput={(event) => {
@@ -513,6 +680,15 @@ export function BrowserPane({
           )}
         </div>
       )}
+      <ElementInspector
+        hidden={mode !== 'page' || !inspectorOpen}
+        selected={state.selectedElement}
+        tabId={state.activeTabId}
+        previews={state.previewEdits ?? []}
+        onAction={onAction}
+        onClose={() => setInspectorOpen(false)}
+        onSourceRequest={onSourceRequest}
+      />
     </section>
   );
 }
