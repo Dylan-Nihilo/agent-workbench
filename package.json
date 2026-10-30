@@ -1,6 +1,6 @@
 {
-  "name": "agent-workbench",
-  "version": "0.2.3",
+  "name": "athena",
+  "version": "0.2.4",
   "private": true,
   "license": "UNLICENSED",
   "author": "Dylan",
@@ -20,7 +20,7 @@
   },
   "build": {
     "appId": "app.agent.workbench",
-    "productName": "Agent Workbench",
+    "productName": "Athena",
     "electronDist": "node_modules/electron/dist",
     "directories": {
       "output": "release"

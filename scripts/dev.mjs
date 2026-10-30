@@ -12,7 +12,7 @@ const child = spawn(electron, ['.'], {
   stdio: 'inherit',
   env: { ...process.env, WORKBENCH_DEV_SERVER_URL: url },
 });
-console.log(`Workbench renderer: ${url}`);
+console.log(`Athena renderer: ${url}`);
 child.once('exit', async (code) => {
   await server.close();
   process.exit(code ?? 0);

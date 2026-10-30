@@ -221,6 +221,12 @@ export interface BrowserFrame {
   height: number;
   tabId?: string;
 }
+export interface BrowserViewport {
+  width: number;
+  height: number;
+  tabId?: string;
+  limited?: boolean;
+}
 export type BrowserInput = (
   | {
       type: 'mouse';

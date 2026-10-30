@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import type {
   BrowserFrame,
+  BrowserViewport,
   BrowserTab,
   ElementDetails,
   ElementQuery,
@@ -376,6 +377,13 @@ export class BrowserRuntime {
   private refs = new Map<string, ScopedElement>();
   private width = 1100;
   private height = 760;
+  private fittedViewport?: {
+    tabId: string;
+    activation: number;
+    url: string;
+    paneWidth: number;
+    width: number;
+  };
   private frameAckTimer?: ReturnType<typeof setTimeout>;
   private starting?: Promise<void>;
   private disposed = false;
@@ -1305,27 +1313,110 @@ export class BrowserRuntime {
       await tab.page.call('Page.reload');
     });
   }
-  resize(width: number, height: number): Promise<void> {
+  resize(
+    width: number,
+    height: number,
+    options: { fitToWidth?: boolean; tabId?: string } = {},
+  ): Promise<BrowserViewport> {
     if (!Number.isFinite(width) || !Number.isFinite(height))
       return Promise.reject(new Error('Invalid browser viewport'));
+    if (
+      (options.fitToWidth !== undefined && typeof options.fitToWidth !== 'boolean') ||
+      (options.tabId !== undefined && typeof options.tabId !== 'string')
+    )
+      return Promise.reject(new Error('Invalid browser viewport options'));
     const w = Math.round(Math.min(1920, Math.max(320, width))),
-      h = Math.round(Math.min(1400, Math.max(100, height)));
-    if (w === this.width && h === this.height) return Promise.resolve();
-    this.width = w;
-    this.height = h;
-    if (this.state.status !== 'ready') return Promise.resolve();
+      h = Math.round(Math.min(8192, Math.max(100, height)));
+    const id = this.activeTabId || undefined;
+    if (options.tabId !== undefined && options.tabId !== id)
+      return Promise.reject(new Error('忽略了来自旧标签页的页面尺寸。'));
+    if (this.state.status !== 'ready') {
+      this.width = w;
+      this.height = h;
+      return Promise.resolve({ width: w, height: h, tabId: id, limited: false });
+    }
     return this.serialize(async () => {
-      const tab = this.activeTab();
+      const tab = this.requireActive(id!);
+      if (!options.fitToWidth) this.fittedViewport = undefined;
+      if (!options.fitToWidth && w === this.width && h === this.height)
+        return { width: w, height: h, tabId: id, limited: false };
+      const previous = { width: this.width, height: this.height };
+      const setViewport = (viewWidth: number, viewHeight: number) =>
+        tab.page.call('Emulation.setDeviceMetricsOverride', {
+          width: viewWidth,
+          height: viewHeight,
+          deviceScaleFactor: 2,
+          mobile: false,
+        });
       if (this.frameAckTimer) clearTimeout(this.frameAckTimer);
       this.frameAckTimer = undefined;
       await tab.page.call('Page.stopScreencast');
-      await tab.page.call('Emulation.setDeviceMetricsOverride', {
-        width: w,
-        height: h,
-        deviceScaleFactor: 2,
-        mobile: false,
-      });
-      await this.startScreencast(tab);
+      try {
+        const maxWidth = Math.max(w, Math.min(1920, Math.floor((8192 * w) / h)));
+        const fitted = this.fittedViewport;
+        const reuseWidth =
+          options.fitToWidth &&
+          fitted &&
+          fitted?.tabId === id &&
+          fitted.activation === tab.activation &&
+          fitted.url === tab.info.url &&
+          fitted.paneWidth === w;
+        let viewWidth = reuseWidth ? Math.min(maxWidth, fitted.width) : w,
+          viewHeight = Math.round((h * viewWidth) / w);
+        await setViewport(viewWidth, viewHeight);
+        if (options.fitToWidth) {
+          // Height-only changes must not briefly switch responsive pages to a different layout.
+          for (let attempt = 0; attempt < 2; attempt++) {
+            const metrics = await tab.page.call('Page.getLayoutMetrics');
+            const contentWidth = metrics.cssContentSize?.width;
+            const layoutWidth = metrics.cssLayoutViewport?.clientWidth;
+            if (!Number.isFinite(contentWidth) || !Number.isFinite(layoutWidth))
+              throw new Error('无法读取页面布局尺寸');
+            if (contentWidth <= layoutWidth + 1) break;
+            const gutter = Math.max(0, viewWidth - layoutWidth);
+            const nextWidth = Math.min(
+              maxWidth,
+              Math.max(viewWidth, Math.ceil(contentWidth + gutter)),
+            );
+            if (nextWidth === viewWidth) break;
+            viewWidth = nextWidth;
+            viewHeight = Math.round((h * viewWidth) / w);
+            await setViewport(viewWidth, viewHeight);
+          }
+        }
+        const metrics = options.fitToWidth
+          ? await tab.page.call('Page.getLayoutMetrics')
+          : undefined;
+        if (
+          metrics &&
+          (!Number.isFinite(metrics.cssContentSize?.width) ||
+            !Number.isFinite(metrics.cssLayoutViewport?.clientWidth))
+        )
+          throw new Error('无法读取页面布局尺寸');
+        this.width = viewWidth;
+        this.height = viewHeight;
+        if (options.fitToWidth)
+          this.fittedViewport = {
+            tabId: id!,
+            activation: tab.activation,
+            url: tab.info.url,
+            paneWidth: w,
+            width: viewWidth,
+          };
+        return {
+          width: viewWidth,
+          height: viewHeight,
+          tabId: id,
+          limited: Boolean(
+            metrics && metrics.cssContentSize.width > metrics.cssLayoutViewport.clientWidth + 1,
+          ),
+        };
+      } catch (error) {
+        await setViewport(previous.width, previous.height).catch(() => {});
+        throw error;
+      } finally {
+        await this.startScreencast(tab);
+      }
     });
   }
 
@@ -1509,7 +1600,7 @@ export class BrowserRuntime {
     const id = this.activeTab().info.id;
     if (input.tabId !== undefined && input.tabId !== id)
       return Promise.reject(new Error('忽略了来自旧标签页的输入。'));
-    if (input.type === 'resize') return this.resize(input.width, input.height);
+    if (input.type === 'resize') return this.resize(input.width, input.height).then(() => {});
     if (input.type === 'mouse') this.hoverEpoch++;
     if (input.type === 'mouse' && input.action === 'leave') {
       const tab = this.activeTab(),

@@ -2,13 +2,13 @@
 
 核查日期：2026-10-29。版本来自本次安装的包及锁文件；正式构建以 `package-lock.json` 和实际随包内容为准。
 
-Agent Workbench（界面简称 Workbench，仓库名 `agent-workbench`）的仓库公开可见，项目代码保持 `UNLICENSED`，尚未授予开源许可证。以下许可属于相应第三方组件，不构成对 Workbench 本身的 MIT 或其他许可授权。
+Athena（仓库名 `athena`）的仓库公开可见，项目代码保持 `UNLICENSED`，尚未授予开源许可证。以下许可属于相应第三方组件，不构成对 Athena 本身的 MIT 或其他许可授权。
 
 ## 独立进程组件
 
 | 项目 | 本项目使用方式 | 上游许可 |
 |---|---|---|
-| BrowserOS neo | 从官方分发获取的后台浏览器进程；原生引擎以 Retina DPR 2 渲染，页面帧流嵌入 Workbench 同窗口的右侧滑出面板，无独立浏览器窗口；使用独立 profile，关闭 neo sidecars | [BrowserOS LICENSE：AGPL-3.0](https://github.com/browseros-ai/BrowserOS/blob/main/LICENSE)；[项目说明](https://github.com/browseros-ai/BrowserOS) |
+| BrowserOS neo | 从官方分发获取的后台浏览器进程；原生引擎以 Retina DPR 2 渲染，页面帧流嵌入 Athena 同窗口的右侧滑出面板，无独立浏览器窗口；使用独立 profile，关闭 neo sidecars | [BrowserOS LICENSE：AGPL-3.0](https://github.com/browseros-ai/BrowserOS/blob/main/LICENSE)；[项目说明](https://github.com/browseros-ai/BrowserOS) |
 | OpenAI Codex CLI | 用户自行安装并登录，本应用通过其 `app-server` 接口交互 | [Codex LICENSE：Apache-2.0](https://github.com/openai/codex/blob/main/LICENSE)；[NOTICE](https://github.com/openai/codex/blob/main/NOTICE) |
 
 BrowserOS neo 和 Electron 均包含 Chromium 及其他第三方组件，各组件可能采用不同许可证。保留官方浏览器/运行时分发随附的完整 LICENSE、NOTICE 和 Chromium 第三方声明；Chromium 本身的许可见 [Chromium LICENSE](https://chromium.googlesource.com/chromium/src/+/main/LICENSE)。

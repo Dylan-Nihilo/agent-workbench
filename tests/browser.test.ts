@@ -1809,3 +1809,158 @@ test('bridge rejects migration after preparation without sending or replaying an
   );
   assert.equal(actions, 0);
 });
+
+test(
+  'real BrowserOS neo: fit width reveals a fixed desktop page and preserves scaled input',
+  { skip: !binary, timeout: 30_000 },
+  async () => {
+    const storageDir = await mkdtemp(join(tmpdir(), 'workbench-fit-width-test-'));
+    const server = createServer((request, response) => {
+      response.setHeader('Content-Type', 'text/html; charset=utf-8');
+      const wide = request.url !== '/responsive';
+      const minimum = request.url === '/oversized' ? 3000 : 1100;
+      const gutter = request.url === '/gutter';
+      response.end(`<!doctype html><title>${wide ? 'Desktop width' : 'Responsive width'}</title><style>
+${gutter ? 'html{overflow-y:scroll}::-webkit-scrollbar{width:20px}' : ''}
+body{margin:0;${wide ? `min-width:${minimum}px;` : ''}${gutter ? 'min-height:2000px;' : ''}font:20px system-ui}header{display:flex;align-items:center;gap:24px;padding:28px}strong{width:170px}input{width:${wide ? '680px' : '100%'};min-width:0;box-sizing:border-box}button{flex:none;width:110px}#result{margin:28px}
+</style><header>${wide ? '<strong>Search</strong>' : ''}<input value="kept input"/><button id="right" onclick="document.querySelector('#result').textContent='clicked'">Search</button></header><div id="result">not clicked</div>${gutter ? '<div id="edge" style="position:absolute;left:1060px;width:40px;height:40px"></div>' : ''}`);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    let latestFrame: BrowserFrame | undefined;
+    const runtime = new BrowserRuntime({
+      storageDir,
+      binaryPath: binary,
+      onState() {},
+      onFrame(frame) {
+        if (frame.data) latestFrame = frame;
+      },
+      onStep() {},
+      onSelected() {},
+      onHumanTakeover() {},
+    });
+    const evaluate = async (expression: string) => {
+      const state = runtime.getState();
+      const page = (runtime as any).tabs.get(state.activeTabId).page;
+      const result = await page.call('Runtime.evaluate', { expression, returnByValue: true });
+      if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
+      return result.result.value;
+    };
+    const metrics = () =>
+      evaluate(
+        `(()=>{const rect=document.querySelector('#right').getBoundingClientRect();return{width:innerWidth,height:innerHeight,clientWidth:document.documentElement.clientWidth,edgeRight:document.querySelector('#edge')?.getBoundingClientRect().right,contentWidth:document.documentElement.scrollWidth,right:rect.right,x:rect.x+rect.width/2,y:rect.y+rect.height/2,value:document.querySelector('input').value,bodyStyle:document.body.getAttribute('style')}})()`,
+      );
+    const waitFor = async <T>(read: () => Promise<T>, matches: (value: T) => boolean) => {
+      const end = Date.now() + 8000;
+      while (Date.now() < end) {
+        try {
+          const value = await read();
+          if (matches(value)) return value;
+        } catch {}
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.fail('Expected fitted page state did not arrive');
+    };
+    try {
+      await runtime.start();
+      await runtime.resize(620, 490);
+      await runtime.navigate(origin);
+      await waitFor(metrics, (value) => value.contentWidth === 1100);
+      assert.ok(
+        (await metrics()).right > 620,
+        'The initial 620px viewport must reproduce the clipped button',
+      );
+      const tabId = runtime.getState().activeTabId!;
+      const fit = await runtime.resize(620, 490, { fitToWidth: true, tabId });
+      const fitted = await metrics();
+      assert.ok(
+        fitted.right <= fitted.width,
+        'Fit width must reveal the clipped desktop search button',
+      );
+      assert.deepEqual(fit, { width: 1100, height: 869, tabId, limited: false });
+      assert.equal(fitted.width, 1100);
+      assert.equal(fitted.height, 869);
+      assert.equal(fitted.value, 'kept input');
+      assert.equal(fitted.bodyStyle, null, 'Fitting must not inject page zoom or styles');
+      const scale = 620 / fit.width;
+      const displayed = { x: fitted.x * scale, y: fitted.y * scale };
+      await runtime.dispatchInput({
+        type: 'mouse',
+        action: 'down',
+        x: displayed.x / scale,
+        y: displayed.y / scale,
+      });
+      await runtime.dispatchInput({
+        type: 'mouse',
+        action: 'up',
+        x: displayed.x / scale,
+        y: displayed.y / scale,
+      });
+      assert.equal(await evaluate("document.querySelector('#result').textContent"), 'clicked');
+
+      const tall = await runtime.resize(390, 650, { fitToWidth: true, tabId });
+      assert.deepEqual(tall, { width: 1100, height: 1833, tabId, limited: false });
+      const frame = await waitFor(
+        async () => latestFrame,
+        (value) => {
+          if (value?.width !== 1100 || value.height !== 1833) return false;
+          const pixels = jpegDimensions(value);
+          return Math.abs(pixels.width / pixels.height - 1100 / 1833) < 0.002;
+        },
+      );
+      assert.ok(frame);
+      const pixels = jpegDimensions(frame);
+      assert.ok(pixels.width <= 2048 && pixels.height <= 2048);
+      assert.ok(Math.abs(pixels.width / pixels.height - 1100 / 1833) < 0.002);
+      assert.equal((await metrics()).height, 1833);
+
+      await runtime.navigate(origin + '/responsive');
+      await waitFor(
+        () => evaluate('document.title'),
+        (title) => title === 'Responsive width',
+      );
+      const responsive = await runtime.resize(390, 650, { fitToWidth: true, tabId });
+      assert.deepEqual(responsive, { width: 390, height: 650, tabId, limited: false });
+      assert.equal(
+        (await metrics()).contentWidth,
+        390,
+        'Responsive navigation must return to the pane width',
+      );
+      await runtime.navigate(origin + '/gutter');
+      await waitFor(metrics, (value) => value.edgeRight === 1100);
+      const gutterFit = await runtime.resize(620, 490, { fitToWidth: true, tabId });
+      const gutterPage = await metrics();
+      assert.ok(
+        gutterPage.edgeRight <= gutterPage.clientWidth,
+        'Fit must include the vertical scrollbar gutter',
+      );
+      assert.deepEqual(gutterFit, { width: 1120, height: 885, tabId, limited: false });
+      await runtime.navigate(origin + '/oversized');
+      await waitFor(metrics, (value) => value.contentWidth === 3000);
+      const limited = await runtime.resize(390, 650, { fitToWidth: true, tabId });
+      assert.deepEqual(limited, { width: 1920, height: 3200, tabId, limited: true });
+      const second = await runtime.newTab(origin);
+      await waitFor(
+        () => evaluate('document.title'),
+        (title) => title === 'Desktop width',
+      );
+      const before = await metrics();
+      await assert.rejects(runtime.resize(600, 400, { fitToWidth: true, tabId }), /标签页/);
+      assert.deepEqual(
+        await metrics(),
+        before,
+        'A stale tab resize must not alter the active page',
+      );
+      await runtime.switchTab(tabId);
+      const switching = runtime.switchTab(second.id);
+      const staleQueued = runtime.resize(620, 490, { fitToWidth: true, tabId });
+      await switching;
+      await assert.rejects(staleQueued, /标签页/);
+      assert.equal((await metrics()).width, before.width);
+    } finally {
+      await runtime.dispose();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(storageDir, { recursive: true, force: true });
+    }
+  },
+);

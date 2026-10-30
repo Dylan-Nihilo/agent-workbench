@@ -256,7 +256,7 @@ export default function App() {
   }, []);
   useEffect(() => {
     if (!window.workbench) {
-      showToast('请在 Workbench 桌面应用中打开这个工作区', true);
+      showToast('请在 Athena 桌面应用中打开这个工作区', true);
       return;
     }
     let disposed = false;
@@ -557,7 +557,7 @@ export default function App() {
           <span className="brand-mark">
             <Command size={18} strokeWidth={1.7} />
           </span>
-          <span>Workbench</span>
+          <span>Athena</span>
         </div>
         <button className="new-conversation" onClick={() => void newConversation()}>
           <Plus size={17} />
@@ -758,7 +758,7 @@ export default function App() {
                         <>
                           <div className="assistant-label">
                             <Command size={14} />
-                            <span>Workbench</span>
+                            <span>Athena</span>
                           </div>
                           {!!message.tools?.length && <ToolActivity tools={message.tools} />}
                           {message.text && (
@@ -1250,7 +1250,7 @@ export default function App() {
                     {feishu.paired ? (
                       <p>
                         可在私聊中发起任务。桌面和飞书任务结束、失败或需要你回答、审核时，
-                        机器人会通知你。请保持 Mac 在线；回答与审批在 Workbench 中完成。
+                        机器人会通知你。请保持 Mac 在线；回答与审批在 Athena 中完成。
                       </p>
                     ) : (
                       <>

@@ -20,6 +20,7 @@ import type {
   BrowserFrame,
   BrowserInput,
   BrowserState,
+  BrowserViewport,
   ElementDetails,
   ElementEdit,
   RecordedStep,
@@ -71,6 +72,12 @@ export function BrowserPane({
   const [frameLoading, setFrameLoading] = useState(!initialFrame?.data);
   const [viewportPending, setViewportPending] = useState(false);
   const [tabBusy, setTabBusy] = useState(false);
+  const [zoomModes, setZoomModes] = useState<Record<string, 'fit' | 'actual'>>({});
+  const [zoomPercent, setZoomPercent] = useState(100);
+  const [fitLimited, setFitLimited] = useState(false);
+  const [viewportError, setViewportError] = useState(false);
+  const [viewportRetry, setViewportRetry] = useState(0);
+  const zoomMode = zoomModes[state.activeTabId ?? ''] ?? 'fit';
   const image = useRef<HTMLImageElement>(null);
   const lastFrame = useRef(initialFrame?.data || '');
   const activeTab = useRef(state.activeTabId);
@@ -81,25 +88,43 @@ export function BrowserPane({
     width: initialFrame?.width || 960,
     height: initialFrame?.height || 720,
   });
+  const decodedViewport = useRef<BrowserViewport | undefined>(undefined);
+  const expectedViewport = useRef<
+    (BrowserViewport & { surfaceWidth: number; surfaceHeight: number }) | undefined
+  >(undefined);
+  const resizeRequest = useRef(0);
   const composing = useRef(false);
   const compositionTab = useRef<string | undefined>(undefined);
   const compositionCommit = useRef<{ value: string; time: number } | undefined>(undefined);
   const pointerFrame = useRef<number>(0);
-  const inspectPending = useRef(false);
+  const inspectActive = useRef(false);
   const busy = state.status === 'starting' || state.loading;
   const ready = state.status === 'ready';
   const recording = recordings.find((item) => item.id === recordingId) || recordings[0];
+  const alignedViewport = () => {
+    const bounds = surface.current?.getBoundingClientRect();
+    const expected = expectedViewport.current;
+    const bitmap = image.current;
+    return Boolean(
+      bounds &&
+      expected &&
+      bitmap?.naturalWidth &&
+      Math.abs(
+        bitmap.naturalWidth -
+          (bitmap.naturalHeight * viewport.current.width) / viewport.current.height,
+      ) <= 2 &&
+      expected.tabId === activeTab.current &&
+      Math.abs(expected.surfaceWidth - Math.floor(bounds.width)) <= 1 &&
+      Math.abs(expected.surfaceHeight - Math.floor(bounds.height)) <= 1 &&
+      Math.abs(viewport.current.width - expected.width) <= 1 &&
+      Math.abs(viewport.current.height - expected.height) <= 1 &&
+      decodedViewport.current?.tabId === expected.tabId &&
+      decodedViewport.current?.width === viewport.current.width &&
+      decodedViewport.current?.height === viewport.current.height,
+    );
+  };
   const sendInput = (input: BrowserInput) => {
-    if (input.type === 'mouse' || input.type === 'wheel') {
-      const bounds = surface.current?.getBoundingClientRect();
-      if (
-        !bounds ||
-        Math.abs(viewport.current.width - Math.floor(bounds.width)) > 1 ||
-        Math.abs(viewport.current.height - Math.floor(bounds.height)) > 1
-      )
-        return;
-    }
-    if (ready && !frameLoading && !viewportPending)
+    if (ready && !frameLoading && !viewportPending && alignedViewport())
       void window.workbench
         .invoke('browser:input', { ...input, tabId: input.tabId ?? activeTab.current })
         .catch(() => {});
@@ -109,7 +134,7 @@ export function BrowserPane({
     const cancel = (event: KeyboardEvent) => {
       if (
         event.key !== 'Escape' ||
-        (!state.inspecting && !inspectPending.current) ||
+        (!state.inspecting && !inspectActive.current) ||
         document.querySelector('dialog[open]')
       )
         return;
@@ -138,6 +163,7 @@ export function BrowserPane({
     if (state.activeTabId !== activeTab.current) {
       activeTab.current = state.activeTabId;
       lastFrame.current = '';
+      decodedViewport.current = undefined;
       image.current?.removeAttribute('src');
       setFrameLoading(true);
     }
@@ -145,9 +171,11 @@ export function BrowserPane({
   useEffect(
     () =>
       window.workbench.onEvent((event) => {
+        if (event.type === 'browser:state') inspectActive.current = event.state.inspecting;
         if (event.type === 'browser:state' && event.state.activeTabId !== activeTab.current) {
           activeTab.current = event.state.activeTabId;
           lastFrame.current = '';
+          decodedViewport.current = undefined;
           image.current?.removeAttribute('src');
           setFrameLoading(true);
         }
@@ -155,6 +183,7 @@ export function BrowserPane({
           if (event.frame.tabId && event.frame.tabId !== activeTab.current) return;
           if (!event.frame.data) {
             lastFrame.current = '';
+            decodedViewport.current = undefined;
             image.current?.removeAttribute('src');
             setFrameLoading(true);
             return;
@@ -169,31 +198,57 @@ export function BrowserPane({
     [],
   );
   useEffect(() => {
-    if (!surface.current || mode !== 'page' || !ready) return;
+    expectedViewport.current = undefined;
+    setViewportPending(true);
+    if (!surface.current || mode !== 'page' || !ready || state.loading) return;
     let timer: ReturnType<typeof setTimeout>;
     const observer = new ResizeObserver((entries) => {
       clearTimeout(timer);
       const bounds = entries[0].contentRect;
-      setViewportPending(
-        Math.abs(viewport.current.width - Math.floor(bounds.width)) > 1 ||
-          Math.abs(viewport.current.height - Math.floor(bounds.height)) > 1,
-      );
+      expectedViewport.current = undefined;
+      setViewportPending(true);
+      setViewportError(false);
+      const current = ++resizeRequest.current;
+      const tabId = state.activeTabId;
       timer = setTimeout(() => {
         if (bounds.width > 100 && bounds.height > 100)
           void window.workbench
-            .invoke('browser:resize', {
+            .invoke<BrowserViewport>('browser:resize', {
               width: Math.floor(bounds.width),
               height: Math.floor(bounds.height),
+              fitToWidth: zoomMode === 'fit',
+              tabId,
             })
-            .catch(() => {});
+            .then((value) => {
+              if (
+                !value ||
+                current !== resizeRequest.current ||
+                tabId !== activeTab.current ||
+                value.tabId !== tabId
+              )
+                return;
+              expectedViewport.current = {
+                ...value,
+                surfaceWidth: Math.floor(bounds.width),
+                surfaceHeight: Math.floor(bounds.height),
+              };
+              setZoomPercent(Math.round((bounds.width / value.width) * 100));
+              setFitLimited(Boolean(value.limited));
+              setViewportPending(!alignedViewport());
+            })
+            .catch(() => {
+              if (current === resizeRequest.current && tabId === activeTab.current)
+                setViewportError(true);
+            });
       }, 120);
     });
     observer.observe(surface.current);
     return () => {
       observer.disconnect();
       clearTimeout(timer);
+      resizeRequest.current++;
     };
-  }, [mode, ready]);
+  }, [mode, ready, zoomMode, state.activeTabId, state.url, state.loading, viewportRetry]);
   useEffect(() => {
     const node = surface.current;
     if (!node) return;
@@ -206,8 +261,8 @@ export function BrowserPane({
         type: 'wheel',
         x: (event.clientX - bounds.left) * scale,
         y: (event.clientY - bounds.top) * scale,
-        deltaX: event.deltaX,
-        deltaY: event.deltaY,
+        deltaX: (event.shiftKey && !event.deltaX ? event.deltaY : event.deltaX) * scale,
+        deltaY: (event.shiftKey && !event.deltaX ? 0 : event.deltaY) * scale,
         modifiers: modifiers(event),
       });
     };
@@ -225,12 +280,7 @@ export function BrowserPane({
   };
   const pointer = (event: React.MouseEvent<HTMLDivElement>, action: 'move' | 'down' | 'up') => {
     if (!ready || frameLoading || viewportPending || event.target === keyboard.current) return;
-    const bounds = event.currentTarget.getBoundingClientRect();
-    if (
-      Math.abs(viewport.current.width - Math.floor(bounds.width)) > 1 ||
-      Math.abs(viewport.current.height - Math.floor(bounds.height)) > 1
-    )
-      return;
+    if (!alignedViewport()) return;
     if (action === 'down') {
       event.preventDefault();
       keyboard.current?.focus({ preventScroll: true });
@@ -463,10 +513,12 @@ export function BrowserPane({
             disabled={!ready}
             onClick={() => {
               setMode('page');
-              inspectPending.current = true;
-              void onAction('browser:inspect', { enabled: !state.inspecting }).finally(() => {
-                inspectPending.current = false;
-              });
+              inspectActive.current = !state.inspecting;
+              void onAction<boolean>('browser:inspect', { enabled: !state.inspecting }).then(
+                (ok) => {
+                  if (!ok) inspectActive.current = false;
+                },
+              );
             }}
           >
             <MousePointer2 size={14} />
@@ -518,19 +570,54 @@ export function BrowserPane({
               alt={state.title ? `${state.title}，可交互网页` : 'BrowserOS neo 页面'}
               draggable={false}
               onLoad={() => {
-                setFrameLoading(false);
-                const bounds = surface.current?.getBoundingClientRect();
-                if (bounds)
-                  setViewportPending(
-                    Math.abs(viewport.current.width - Math.floor(bounds.width)) > 1 ||
-                      Math.abs(viewport.current.height - Math.floor(bounds.height)) > 1,
-                  );
+                const node = image.current;
+                const source = lastFrame.current;
+                const frame = { ...viewport.current, tabId: activeTab.current };
+                if (!node) return;
+                void node
+                  .decode()
+                  .then(() => {
+                    if (
+                      image.current !== node ||
+                      lastFrame.current !== source ||
+                      node.currentSrc !== source ||
+                      activeTab.current !== frame.tabId
+                    )
+                      return;
+                    if (
+                      Math.abs(
+                        node.naturalWidth - (node.naturalHeight * frame.width) / frame.height,
+                      ) > 2
+                    ) {
+                      decodedViewport.current = undefined;
+                      setViewportPending(true);
+                      return;
+                    }
+                    decodedViewport.current = frame;
+                    setFrameLoading(false);
+                    setViewportPending(!alignedViewport());
+                  })
+                  .catch(() => {});
               }}
             />
             {ready && (frameLoading || viewportPending) && (
               <div className="frame-loading">
-                <Loader2 size={19} className="spin" />
-                <span>正在显示页面</span>
+                {viewportError ? (
+                  <>
+                    <span>页面显示调整失败</span>
+                    <button
+                      className="secondary-button"
+                      onClick={() => setViewportRetry((value) => value + 1)}
+                    >
+                      重试
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <Loader2 size={19} className="spin" />
+                    <span>正在显示页面</span>
+                  </>
+                )}
               </div>
             )}
             <textarea
@@ -616,6 +703,26 @@ export function BrowserPane({
                   ? '正在连接'
                   : '未连接'}
             </span>
+            <select
+              className="viewport-mode"
+              aria-label="页面缩放"
+              title={fitLimited ? '页面超宽，可按住 Shift 滚轮横向查看' : '选择页面显示比例'}
+              value={zoomMode}
+              disabled={!ready || state.loading}
+              onChange={(event) => {
+                if (state.activeTabId)
+                  setZoomModes((previous) => ({
+                    ...previous,
+                    [state.activeTabId!]: event.target.value as 'fit' | 'actual',
+                  }));
+              }}
+            >
+              <option value="fit">
+                适应宽度{zoomMode === 'fit' && zoomPercent < 100 ? ` · ${zoomPercent}%` : ''}
+              </option>
+              <option value="actual">100%</option>
+            </select>
+            {fitLimited && zoomMode === 'fit' && <span className="viewport-limit">可横向滚动</span>}
             {state.inspecting ? (
               <span className="status-right">选择元素</span>
             ) : agentStatus ? (

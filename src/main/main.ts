@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, safeStorage, shell } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, safeStorage, shell } from 'electron';
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import path from 'node:path';
@@ -26,9 +26,15 @@ import type {
   Recording,
 } from '../shared/types';
 
-if (process.env.WORKBENCH_USER_DATA_DIR)
-  app.setPath('userData', path.resolve(process.env.WORKBENCH_USER_DATA_DIR));
+// Keep the profile and macOS safeStorage key identity compatible with existing installations.
+app.setPath(
+  'userData',
+  process.env.WORKBENCH_USER_DATA_DIR
+    ? path.resolve(process.env.WORKBENCH_USER_DATA_DIR)
+    : path.join(app.getPath('appData'), 'Agent Workbench'),
+);
 app.setName('Agent Workbench');
+app.setAboutPanelOptions({ applicationName: 'Athena' });
 let window: BrowserWindow | undefined;
 let store: Store;
 let browser: BrowserRuntime;
@@ -220,7 +226,7 @@ async function runTurn(
   const notifications = new TurnNotifications(
     { id: assistant.id, title: conversation.title, source },
     (id, message) => feishu.sendNotification(id, message),
-    () => notice('飞书通知未送达，任务状态和结果仍保留在 Workbench。', 'error'),
+    () => notice('飞书通知未送达，任务状态和结果仍保留在 Athena。', 'error'),
   );
   active = {
     conversationId: conversation.id,
@@ -238,7 +244,7 @@ async function runTurn(
     if (assistant.status === 'streaming') assistant.status = 'done';
     if (session.sessionId) conversation.agentSessionId = session.sessionId;
     return notifications.includesSecretInput
-      ? '本轮包含受保护的信息，请在 Workbench 查看结果。'
+      ? '本轮包含受保护的信息，请在 Athena 查看结果。'
       : assistant.text;
   } catch (error) {
     assistant.status = 'error';
@@ -248,7 +254,7 @@ async function runTurn(
       message: error instanceof Error ? error.message : '任务未完成',
     });
     throw notifications.includesSecretInput
-      ? new Error('本轮包含受保护的信息，请在 Workbench 查看执行详情。')
+      ? new Error('本轮包含受保护的信息，请在 Athena 查看执行详情。')
       : error;
   } finally {
     browser.revokeAgentControl();
@@ -296,7 +302,7 @@ function startTurn(
 async function handleFeishuMessage(message: FeishuMessage) {
   if (/^(?:\/cancel|停止|取消)$/i.test(message.text.trim())) {
     await stopTurn();
-    await feishu.sendReply(message, '已发送停止请求。请在 Workbench 中查看任务状态。');
+    await feishu.sendReply(message, '已发送停止请求。请在 Athena 中查看任务状态。');
     return;
   }
   if (active || startingTurn) {
@@ -320,14 +326,14 @@ async function handleFeishuMessage(message: FeishuMessage) {
         message.text,
         `任务来自已配对的飞书用户。当前页面：${pageSource(browser.getState().url)}。仅在当前项目与浏览器范围内工作。`,
         'feishu',
-      )) || 'Agent 本轮已结束，可在 Workbench 中查看结果。';
+      )) || 'Agent 本轮已结束，可在 Athena 中查看结果。';
   } catch (error) {
     reply = `任务未完成：${error instanceof Error ? error.message : '未知错误'}`;
   }
   try {
     await feishu.sendReply(message, reply);
   } catch {
-    notice('飞书结果未送达，执行结果仍保留在 Workbench。', 'error');
+    notice('飞书结果未送达，执行结果仍保留在 Athena。', 'error');
   }
 }
 async function createBrowserRuntime(binaryPath?: string) {
@@ -532,8 +538,12 @@ async function invoke(action: string, payload: unknown) {
       const data = record(payload);
       if (!Number.isFinite(data.width) || !Number.isFinite(data.height))
         throw new Error('页面尺寸不正确');
-      await browser.resize(Number(data.width), Number(data.height));
-      return true;
+      if (data.fitToWidth !== undefined && typeof data.fitToWidth !== 'boolean')
+        throw new Error('页面缩放模式不正确');
+      return browser.resize(Number(data.width), Number(data.height), {
+        fitToWidth: data.fitToWidth === true,
+        tabId: data.tabId === undefined ? undefined : string(data.tabId, 200),
+      });
     }
     case 'browser:inspect': {
       const enabled = record(payload).enabled;
@@ -624,6 +634,30 @@ async function invoke(action: string, payload: unknown) {
 
 async function launch() {
   await app.whenReady();
+  if (process.platform === 'darwin') {
+    Menu.setApplicationMenu(
+      Menu.buildFromTemplate([
+        {
+          label: 'Athena',
+          submenu: [
+            { label: '关于 Athena', role: 'about' },
+            { type: 'separator' },
+            { role: 'services' },
+            { type: 'separator' },
+            { label: '隐藏 Athena', role: 'hide' },
+            { role: 'hideOthers' },
+            { role: 'unhide' },
+            { type: 'separator' },
+            { label: '退出 Athena', role: 'quit' },
+          ],
+        },
+        { role: 'fileMenu' },
+        { role: 'editMenu' },
+        { role: 'viewMenu' },
+        { role: 'windowMenu' },
+      ]),
+    );
+  }
   app.dock?.setIcon(path.join(app.getAppPath(), 'resources/icon.png'));
   const demoHtml = await readFile(path.join(app.getAppPath(), 'resources/demo.html'));
   demoServer = createServer((request, response) => {
@@ -667,7 +701,7 @@ async function launch() {
     height: 950,
     minWidth: 1060,
     minHeight: 700,
-    title: 'Agent Workbench',
+    title: 'Athena',
     backgroundColor: '#ffffff',
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 20, y: 21 },
@@ -730,11 +764,11 @@ else {
   });
   void launch().catch((error) => {
     console.error(
-      'Workbench startup failed:',
+      'Athena startup failed:',
       error instanceof Error ? error.message : 'Unknown error',
     );
     dialog.showErrorBox(
-      'Workbench 无法启动',
+      'Athena 无法启动',
       error instanceof Error ? error.message : '请重新打开应用',
     );
     app.quit();

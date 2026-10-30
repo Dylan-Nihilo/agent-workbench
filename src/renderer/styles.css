@@ -1503,8 +1503,27 @@ kbd {
   border-top: 1px solid #f2f4f8;
 }
 .browser-status > span:nth-child(2) {
+  flex: 1;
+  min-width: 0;
   text-overflow: ellipsis;
   overflow: hidden;
+  white-space: nowrap;
+}
+.viewport-mode {
+  max-width: 130px;
+  height: 22px;
+  border: 0;
+  border-radius: 4px;
+  padding: 0 4px;
+  background: transparent;
+  color: var(--secondary);
+  font: inherit;
+  cursor: pointer;
+}
+.viewport-mode:hover {
+  background: var(--hover);
+}
+.viewport-limit {
   white-space: nowrap;
 }
 .status-right {

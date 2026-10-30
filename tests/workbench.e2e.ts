@@ -72,6 +72,17 @@ const errors: string[] = [];
 try {
   const page = await application.firstWindow();
   page.on('pageerror', (error) => errors.push(error.message));
+  await expect(page).toHaveTitle('Athena');
+  await expect(page.locator('.brand')).toHaveText('Athena');
+  const identity = await application.evaluate(({ app, Menu }) => ({
+    internalName: app.getName(),
+    userData: app.getPath('userData'),
+    applicationMenu: Menu.getApplicationMenu()?.items[0]?.label,
+  }));
+  assert.equal(identity.internalName, 'Agent Workbench');
+  assert.equal(identity.userData, path.join(temporary, 'data'));
+  if (process.platform === 'darwin') assert.equal(identity.applicationMenu, 'Athena');
+  checks.push('Athena branding preserves the existing profile, keychain and IPC identities');
   await application.evaluate(({ BrowserWindow }) => {
     const window = BrowserWindow.getAllWindows()[0];
     window.webContents.setBackgroundThrottling(false);

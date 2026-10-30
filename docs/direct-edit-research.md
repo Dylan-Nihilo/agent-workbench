@@ -1,6 +1,6 @@
 # 页面直接编辑方案调研
 
-核验日期：2026-10-30。架构基线：Workbench `9a2b521`；浏览器实测：BrowserOS neo / Chromium `155.0.8314.26`。本报告区分官方能力、对本项目的适配判断，以及已完成的本机探针；没有安装下列编辑器，也没有将其宣称为已集成。
+核验日期：2026-10-30。架构基线：Athena（原 Workbench）`9a2b521`；浏览器实测：BrowserOS neo / Chromium `155.0.8314.26`。本报告区分官方能力、对本项目的适配判断，以及已完成的本机探针；没有安装下列编辑器，也没有将其宣称为已集成。
 
 ## 结论
 
@@ -12,21 +12,21 @@
 
 - Electron 的 `BrowserPane` 显示 BrowserOS neo 推送的 JPEG 帧，将鼠标、键盘和滚动传回 CDP。React renderer 并不拥有目标网页中的按钮或文字 DOM。
 - `BrowserRuntime` 在目标 frame 的 isolated world 安装页面桥接；元素引用绑定 tab、frame、document 与激活状态。当前文字/样式/动效预览由桥接执行，支持撤销；源码修改另经本机 CLI。
-- 因此，把一个 React 编辑器装在 Workbench renderer 中，只会接触本地 UI 或那张页面图片。要直接控制远端网页元素，仍须在目标文档运行适配层，或使用 CDP 的 DOM/Overlay 接口。完整编辑器不自动消除这层工作。
+- 因此，把一个 React 编辑器装在 Athena renderer 中，只会接触本地 UI 或那张页面图片。要直接控制远端网页元素，仍须在目标文档运行适配层，或使用 CDP 的 DOM/Overlay 接口。完整编辑器不自动消除这层工作。
 
-代码依据：[BrowserPane](https://github.com/Dylan-Nihilo/agent-workbench/blob/9a2b521/src/renderer/BrowserPane.tsx)、[BrowserRuntime](https://github.com/Dylan-Nihilo/agent-workbench/blob/9a2b521/src/main/browser.ts)、[页面桥接](https://github.com/Dylan-Nihilo/agent-workbench/blob/9a2b521/src/main/browser-page.ts)、[检查器与源码请求](https://github.com/Dylan-Nihilo/agent-workbench/blob/9a2b521/src/renderer/ElementInspector.tsx)。
+代码依据：[BrowserPane](https://github.com/Dylan-Nihilo/athena/blob/9a2b521/src/renderer/BrowserPane.tsx)、[BrowserRuntime](https://github.com/Dylan-Nihilo/athena/blob/9a2b521/src/main/browser.ts)、[页面桥接](https://github.com/Dylan-Nihilo/athena/blob/9a2b521/src/main/browser-page.ts)、[检查器与源码请求](https://github.com/Dylan-Nihilo/athena/blob/9a2b521/src/renderer/ElementInspector.tsx)。
 
 ## 候选比较
 
-| 方案                              | 已有能力与许可                                                                                                                                                                                                                                            | 与 Workbench 的适配判断                                                                                                                                    | 建议                                                                                                               |
-| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| **Chromium CDP Overlay**          | 原生悬停检查、节点高亮、盒模型和选择事件；协议仓库 BSD-3-Clause，Overlay 域仍标为 experimental。[协议源码](https://github.com/ChromeDevTools/devtools-protocol/blob/master/pdl/domains/Overlay.pdl)                                                       | 与现有 CDP 通道直接兼容；不需要迁移网页到编辑器的数据模型。它解决选取和高亮，不负责文字编辑、撤销、AI 或源码写回。                                         | 最成熟的底层选择参考；本机探针已证实基本可用。可逐步用于盒模型/原生节点诊断，不必为了本次 hover 重写现有编辑内核。 |
-| **React Grab**                    | 悬停选择后提取元素、组件堆栈与源码位置；MIT；`react-grab/primitives` 提供结构化上下文和命中检测。[README](https://github.com/aidenybai/react-grab)、[primitives](https://github.com/aidenybai/react-grab/blob/main/packages/react-grab/src/primitives.ts) | 很适合“本地开发页面 → CLI 修改组件”这一步。需要在目标应用中接入；在 Workbench renderer 安装不会读到 neo 的 React Fiber。任意远端网站可能没有可用源码信息。 | 下一阶段首选适配器，仅用于明确关联的本地开发项目；复用上下文提取，保留 Workbench 交互和审批。                      |
-| **React Dev Inspector**           | 点击 React 元素跳转本地 IDE；MIT。官方流程包含页面 Inspector、开发服务器中间件和开发时源码信息。[官方仓库](https://github.com/zthxxx/react-dev-inspector)                                                                                                 | 适合定位源码；不负责把拖动、样式或自然语言改动回写源码。需要应用/开发服务器接入。                                                                          | “打开对应文件”的轻量备选；如已采用 React Grab，不必重复引入。                                                      |
-| **Puck**                          | 注册 React 组件、字段配置、拖放、数据持久化、inline text、可定制 hover/selected overlay；MIT。[集成模型](https://github.com/puckeditor/puck)、[inline text 与 overlay](https://puckeditor.com/blog/puck-020)                                              | UI 模式与需求接近，但编辑对象是其 `config + data` 渲染的组件，不是任意正在运行的第三方网页。适合我们控制组件和数据的场景。                                 | 如增加独立页面搭建器，优先评估；当前浏览器编辑器无需迁移到 Puck。                                                  |
-| **GrapesJS Core**                 | HTML/CSS 模板、组件模型、样式面板、层级、存储、富文本；Core 为 BSD 三条款许可。[组件模型](https://grapesjs.com/docs/modules/Components.html)、[Core LICENSE](https://github.com/GrapesJS/grapesjs/blob/dev/packages/core/LICENSE)                         | 导入 HTML 会被解析为它的组件模型和画布；不能据此承诺保留原网站 React 状态、监听器、路由或登录流程。                                                        | 更适合邮件、静态页面、模板编辑。Core 与商业 Studio SDK 要分开判断许可和费用。                                      |
-| **Moveable + Selecto**            | 拖动、缩放、旋转、吸附与框选；均 MIT。[Moveable](https://github.com/daybrush/moveable)、[Selecto](https://github.com/daybrush/selecto)                                                                                                                    | 需要真实 DOM target，须注入目标文档或做远端几何适配。不会把自由移动自动转成正确的 flex/grid/响应式源码；Selecto 的普通矩形命中也有旋转对象限制。           | 仅在明确需要多选、拉伸或自由画布时再评估；为本轮 hover 引入收益有限。                                              |
-| **Builder Content Visual Editor** | SDK 接入后注册自有组件与可编辑 inputs，再在可视化编辑器使用。[官方接入文档](https://www.builder.io/c/docs/custom-components-setup)                                                                                                                        | 是另一套内容/组件编辑工作流，需要接入目标应用及其服务；不等于可嵌入任意现有网页的通用编辑内核。                                                            | 可参考用户交互；本轮没有新增 SaaS、账号或订阅。此处结论仅针对 Content 文档，不混同 Builder Code 产品。             |
+| 方案                              | 已有能力与许可                                                                                                                                                                                                                                            | 与 Athena 的适配判断                                                                                                                                    | 建议                                                                                                               |
+| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| **Chromium CDP Overlay**          | 原生悬停检查、节点高亮、盒模型和选择事件；协议仓库 BSD-3-Clause，Overlay 域仍标为 experimental。[协议源码](https://github.com/ChromeDevTools/devtools-protocol/blob/master/pdl/domains/Overlay.pdl)                                                       | 与现有 CDP 通道直接兼容；不需要迁移网页到编辑器的数据模型。它解决选取和高亮，不负责文字编辑、撤销、AI 或源码写回。                                      | 最成熟的底层选择参考；本机探针已证实基本可用。可逐步用于盒模型/原生节点诊断，不必为了本次 hover 重写现有编辑内核。 |
+| **React Grab**                    | 悬停选择后提取元素、组件堆栈与源码位置；MIT；`react-grab/primitives` 提供结构化上下文和命中检测。[README](https://github.com/aidenybai/react-grab)、[primitives](https://github.com/aidenybai/react-grab/blob/main/packages/react-grab/src/primitives.ts) | 很适合“本地开发页面 → CLI 修改组件”这一步。需要在目标应用中接入；在 Athena renderer 安装不会读到 neo 的 React Fiber。任意远端网站可能没有可用源码信息。 | 下一阶段首选适配器，仅用于明确关联的本地开发项目；复用上下文提取，保留 Athena 交互和审批。                         |
+| **React Dev Inspector**           | 点击 React 元素跳转本地 IDE；MIT。官方流程包含页面 Inspector、开发服务器中间件和开发时源码信息。[官方仓库](https://github.com/zthxxx/react-dev-inspector)                                                                                                 | 适合定位源码；不负责把拖动、样式或自然语言改动回写源码。需要应用/开发服务器接入。                                                                       | “打开对应文件”的轻量备选；如已采用 React Grab，不必重复引入。                                                      |
+| **Puck**                          | 注册 React 组件、字段配置、拖放、数据持久化、inline text、可定制 hover/selected overlay；MIT。[集成模型](https://github.com/puckeditor/puck)、[inline text 与 overlay](https://puckeditor.com/blog/puck-020)                                              | UI 模式与需求接近，但编辑对象是其 `config + data` 渲染的组件，不是任意正在运行的第三方网页。适合我们控制组件和数据的场景。                              | 如增加独立页面搭建器，优先评估；当前浏览器编辑器无需迁移到 Puck。                                                  |
+| **GrapesJS Core**                 | HTML/CSS 模板、组件模型、样式面板、层级、存储、富文本；Core 为 BSD 三条款许可。[组件模型](https://grapesjs.com/docs/modules/Components.html)、[Core LICENSE](https://github.com/GrapesJS/grapesjs/blob/dev/packages/core/LICENSE)                         | 导入 HTML 会被解析为它的组件模型和画布；不能据此承诺保留原网站 React 状态、监听器、路由或登录流程。                                                     | 更适合邮件、静态页面、模板编辑。Core 与商业 Studio SDK 要分开判断许可和费用。                                      |
+| **Moveable + Selecto**            | 拖动、缩放、旋转、吸附与框选；均 MIT。[Moveable](https://github.com/daybrush/moveable)、[Selecto](https://github.com/daybrush/selecto)                                                                                                                    | 需要真实 DOM target，须注入目标文档或做远端几何适配。不会把自由移动自动转成正确的 flex/grid/响应式源码；Selecto 的普通矩形命中也有旋转对象限制。        | 仅在明确需要多选、拉伸或自由画布时再评估；为本轮 hover 引入收益有限。                                              |
+| **Builder Content Visual Editor** | SDK 接入后注册自有组件与可编辑 inputs，再在可视化编辑器使用。[官方接入文档](https://www.builder.io/c/docs/custom-components-setup)                                                                                                                        | 是另一套内容/组件编辑工作流，需要接入目标应用及其服务；不等于可嵌入任意现有网页的通用编辑内核。                                                         | 可参考用户交互；本轮没有新增 SaaS、账号或订阅。此处结论仅针对 Content 文档，不混同 Builder Code 产品。             |
 
 ## 维护状态快照
 
@@ -65,13 +65,13 @@ AI 请求携带已选元素的必要上下文和允许修改的属性，避免�
 
 ### 然后：原位文字与紧邻元素的操作栏
 
-建议提供“改文字 / 样式 / 交给 AI / 撤销”的紧邻元素操作入口。简单文字字段可在 Workbench 的目标位置显示原位输入控件，提交仍调用现有 `editElement`，使用一个 patch 完成一次可撤销修改。这样可复用现有权限、敏感字段、复杂子树保护和输入处理。
+建议提供“改文字 / 样式 / 交给 AI / 撤销”的紧邻元素操作入口。简单文字字段可在 Athena 的目标位置显示原位输入控件，提交仍调用现有 `editElement`，使用一个 patch 完成一次可撤销修改。这样可复用现有权限、敏感字段、复杂子树保护和输入处理。
 
 如改用目标页 `contenteditable`，必须处理 React 重渲染、IME 组合输入、粘贴 HTML、焦点、Escape、失效引用与撤销；不要全页开启 `designMode`。复杂段落、富文本或组件 children 的结构编辑应进入明确支持的数据模型。Puck 的 inline text 可以作为交互参考，但其字段模型不是任意 DOM 的替代层。
 
 ### 再后：让本地开发页准确回到源码
 
-首选对明确关联的本地 React 项目接入 React Grab primitives，提取组件名、文件、行列与 DOM 信息；将经校验的结果作为现有“修改源码”请求的额外证据。其源码显示命中检测覆盖开放 Shadow DOM 和同源 iframe；跨源 iframe 仍应沿用 Workbench 的 CDP frame 路由。源码位置可能为空，应保留普通 DOM 上下文回退，不根据网页声称的路径直接写文件。[结构化接口](https://github.com/aidenybai/react-grab/blob/main/packages/react-grab/src/primitives.ts)
+首选对明确关联的本地 React 项目接入 React Grab primitives，提取组件名、文件、行列与 DOM 信息；将经校验的结果作为现有“修改源码”请求的额外证据。其源码显示命中检测覆盖开放 Shadow DOM 和同源 iframe；跨源 iframe 仍应沿用 Athena 的 CDP frame 路由。源码位置可能为空，应保留普通 DOM 上下文回退，不根据网页声称的路径直接写文件。[结构化接口](https://github.com/aidenybai/react-grab/blob/main/packages/react-grab/src/primitives.ts)
 
 本地适配器需要允许列表、工作区路径约束、绑定当前 tab/document，以及页面与工作目录的对应验证。不要为了选择元素默认冻结整站 React 更新或已有动画；React Grab 的 freeze 是另一项可选能力。
 
@@ -80,6 +80,6 @@ AI 请求携带已选元素的必要上下文和允许修改的属性，避免�
 ## 验收与尚未证明的部分
 
 - 本轮研究没有引入第三方依赖；CDP 探针不等于已替换产品中的选择器。
-- React Grab 的官方“2× faster”是其自身宣称，本报告没有复现，不把它用作 Workbench 的性能承诺。
+- React Grab 的官方“2× faster”是其自身宣称，本报告没有复现，不把它用作 Athena 的性能承诺。
 - 未来接入前必须锁具体包版本、保留相应 MIT/BSD 通知，并验证项目实际 React 版本、iframe、Shadow DOM、CSP、输入法及 reduced motion。
 - 任意外部网页的页面预览不会自动变为对方服务器上的持久修改；源码落盘仅适用于已确认并授权的本地项目。

@@ -357,7 +357,7 @@ export class FeishuConnector {
     qrTimeout.unref();
     controller.signal.addEventListener('abort', () => clearTimeout(qrTimeout), { once: true });
     const task = (async () => {
-      const probe = 'Workbench encrypted storage check';
+      const probe = 'Athena encrypted storage check';
       if ((await this.options.decrypt(await this.options.encrypt(probe))) !== probe)
         throw new Error('Encrypted storage check failed');
       if (!current()) throw new Error('Feishu setup cancelled');
@@ -365,7 +365,7 @@ export class FeishuConnector {
         createOnly: true,
         source: 'agent-workbench',
         signal: controller.signal,
-        appPreset: { name: 'Workbench Demo', desc: '连接本机 Workbench，协作浏览与执行任务' },
+        appPreset: { name: 'Athena Demo', desc: '连接本机 Athena，协作浏览与执行任务' },
         addons: {
           preset: false,
           scopes: { tenant: ['im:message.p2p_msg:readonly', 'im:message:send_as_bot'] },
@@ -464,7 +464,7 @@ export class FeishuConnector {
     this.assertActive();
     if (this.transport && (this.state.status === 'connected' || this.state.status === 'connecting'))
       return this.getState();
-    if (!this.credentials) throw new Error('请先创建或配置 Workbench 专用飞书机器人。');
+    if (!this.credentials) throw new Error('请先创建或配置 Athena 专用飞书机器人。');
     const credentials = this.credentials;
     const generation = ++this.generation;
     this.transport?.close();
@@ -918,7 +918,7 @@ export class FeishuConnector {
         if (item.kind === 'pair')
           await this.sendReply(
             item.message,
-            '已与本机 Workbench 配对。发送文字即可开始任务，发送 /cancel 可取消当前任务。',
+            '已与本机 Athena 配对。发送文字即可开始任务，发送 /cancel 可取消当前任务。',
           );
         else await this.options.onMessage(item.message);
         item.status = 'done';
@@ -938,7 +938,7 @@ export class FeishuConnector {
           try {
             await this.sendReply(
               item.message,
-              '任务处理失败，请查看本机 Workbench 中的错误信息。为避免重复操作，本次未自动重试。',
+              '任务处理失败，请查看本机 Athena 中的错误信息。为避免重复操作，本次未自动重试。',
             );
           } catch {
             /* sendReply already reports the delivery failure to the desktop. */
