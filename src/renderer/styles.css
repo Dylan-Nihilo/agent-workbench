@@ -1133,6 +1133,34 @@ kbd {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 9px 10px;
 }
+.style-fields .wide {
+  grid-column: 1 / -1;
+}
+.motion-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 110px;
+  gap: 10px 12px;
+}
+.motion-fields label > span {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--secondary);
+  font-size: 10px;
+}
+.motion-fields input,
+.motion-fields select {
+  width: 100%;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  color: var(--ink);
+  background: var(--paper);
+  font-size: 11px;
+}
+.motion-fields > p {
+  grid-column: 1 / -1;
+}
 .style-fields label > span {
   display: block;
   font-size: 10px;

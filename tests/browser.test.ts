@@ -5,7 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { BrowserRuntime, normalizeBrowserUrl, redactBrowserText } from '../src/main/browser';
-import type { BrowserFrame, ElementRef, RecordedStep } from '../src/shared/types';
+import type { BrowserFrame, ElementRef, RecordedStep, ElementAnimation } from '../src/shared/types';
 
 function jpegDimensions(frame: BrowserFrame): { width: number; height: number } {
   const bytes = Buffer.from(frame.data.split(',')[1], 'base64');
@@ -73,6 +73,319 @@ test('screenshots discard pixels when a masked document changes during capture',
 });
 
 const binary = process.env.WORKBENCH_BROWSEROS_TEST_BINARY;
+test(
+  'real BrowserOS neo: resize publishes the new viewport during continuous motion',
+  { skip: !binary, timeout: 30_000 },
+  async () => {
+    const storageDir = await mkdtemp(join(tmpdir(), 'workbench-motion-resize-test-'));
+    const server = createServer((_request, response) => {
+      response.setHeader('Content-Type', 'text/html; charset=utf-8');
+      response.end(
+        '<!doctype html><style>body{padding:20px}button{padding:14px 28px}</style><button id="moving">Motion resize</button>',
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    let lastFrame: BrowserFrame | undefined;
+    let frameSequence = 0;
+    const frameWaiters = new Set<() => void>();
+    const runtime = new BrowserRuntime({
+      storageDir,
+      binaryPath: binary,
+      onState() {},
+      onFrame: (frame) => {
+        lastFrame = frame;
+        frameSequence++;
+        for (const check of frameWaiters) check();
+      },
+      onStep() {},
+      onSelected() {},
+      onHumanTakeover() {},
+    });
+    try {
+      await runtime.resize(620, 200);
+      await runtime.start(`http://127.0.0.1:${(server.address() as { port: number }).port}/`);
+      const tabA = runtime.getState().activeTabId!;
+      const page = (runtime as any).tabs.get(runtime.getState().activeTabId).page;
+      await page.call('Emulation.setEmulatedMedia', {
+        features: [{ name: 'prefers-reduced-motion', value: 'no-preference' }],
+      });
+      const waitViewport = (height: number, afterSequence = 0): Promise<void> =>
+        new Promise((resolve, reject) => {
+          const check = () => {
+            if (
+              frameSequence > afterSequence &&
+              lastFrame?.data &&
+              lastFrame.tabId === runtime.getState().activeTabId &&
+              lastFrame.width === 620 &&
+              lastFrame.height === height &&
+              jpegDimensions(lastFrame).width === 1240 &&
+              jpegDimensions(lastFrame).height === height * 2
+            ) {
+              clearTimeout(timer);
+              frameWaiters.delete(check);
+              resolve();
+            }
+          };
+          const timer = setTimeout(async () => {
+            frameWaiters.delete(check);
+            const currentPage = (runtime as any).tabs.get(runtime.getState().activeTabId).page;
+            const metrics = await currentPage.call('Runtime.evaluate', {
+              expression:
+                '({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,visibility:document.visibilityState})',
+              returnByValue: true,
+            });
+            reject(
+              new Error(
+                `Viewport ${height} never reached the frame stream: ${JSON.stringify({ lastFrame: lastFrame && { width: lastFrame.width, height: lastFrame.height, hasImage: Boolean(lastFrame.data), tabId: lastFrame.tabId }, activeTabId: runtime.getState().activeTabId, metrics: metrics.result.value })}`,
+              ),
+            );
+          }, 2500);
+          frameWaiters.add(check);
+          check();
+        });
+      await waitViewport(200);
+      const target = (await runtime.queryElements({ selector: '#moving' })).elements[0];
+      await runtime.editElement(target.ref, {
+        styles: { background: 'linear-gradient(135deg,#d9363e,#9f1239)' },
+        animation: {
+          keyframes: [
+            { styles: { transform: 'translateY(0px)', opacity: '0.7' } },
+            { styles: { transform: 'translateY(-6px)', opacity: '1' } },
+          ],
+          duration: 1600,
+          iterations: 'infinite',
+          direction: 'alternate',
+        },
+      });
+      for (const height of [350, 200, 500, 350, 200, 350]) {
+        await runtime.resize(620, height);
+        await waitViewport(height);
+      }
+      for (let round = 0; round < 3; round++) {
+        await waitViewport(350, frameSequence);
+        const tabB = await runtime.newTab(
+          `http://127.0.0.1:${(server.address() as { port: number }).port}/b`,
+        );
+        await waitViewport(350);
+        const beforeReturn = frameSequence;
+        await runtime.switchTab(tabA);
+        await runtime.resize(620, 500);
+        await waitViewport(500, beforeReturn);
+        await runtime.closeTab(tabB.id);
+        await runtime.resize(620, 350);
+        await waitViewport(350);
+      }
+    } finally {
+      await runtime.dispose();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(storageDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  },
+);
+test(
+  'real BrowserOS neo: gradients and owned motion are one reversible preview',
+  { skip: !binary, timeout: 40_000 },
+  async () => {
+    const storageDir = await mkdtemp(join(tmpdir(), 'workbench-motion-test-'));
+    const server = createServer((_request, response) => {
+      response.setHeader('Content-Type', 'text/html; charset=utf-8');
+      response.end(
+        `<!doctype html><title>Motion fixture</title><style>body{padding:60px;font:18px system-ui}</style><button id="demo-button" style="background-color:rgb(20,40,80);color:white;padding:16px 32px;border-radius:6px;box-shadow:none;transform:none">Preview button</button><script>window.siteMotion=document.querySelector('#demo-button').animate([{letterSpacing:'0px'},{letterSpacing:'1px'}],{duration:2000,iterations:Infinity});window.siteMotion.id='fixture-site-motion';</script>`,
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const steps: RecordedStep[] = [];
+    const runtime = new BrowserRuntime({
+      storageDir,
+      binaryPath: binary,
+      onState() {},
+      onFrame() {},
+      onStep: (step) => steps.push(step),
+      onSelected() {},
+      onHumanTakeover() {},
+    });
+    const waitFor = async <T>(
+      read: () => Promise<T>,
+      accept: (value: T) => boolean,
+    ): Promise<T> => {
+      for (let i = 0; i < 100; i++) {
+        const value = await read();
+        if (accept(value)) return value;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      throw new Error('Expected animation state did not arrive');
+    };
+    const animation: ElementAnimation = {
+      keyframes: [
+        { offset: 0, styles: { transform: 'translateY(0px)', opacity: '0.7' } },
+        { offset: 1, styles: { transform: 'translateY(-6px)', opacity: '1' } },
+      ],
+      duration: 800,
+      iterations: 'infinite',
+      easing: 'ease-in-out',
+      direction: 'alternate',
+    };
+    try {
+      await runtime.start(`http://127.0.0.1:${(server.address() as { port: number }).port}/`);
+      const page = (runtime as any).tabs.get(runtime.getState().activeTabId).page;
+      await page.call('Emulation.setEmulatedMedia', {
+        features: [{ name: 'prefers-reduced-motion', value: 'no-preference' }],
+      });
+      const element = (
+        await waitFor(
+          () => runtime.queryElements({ selector: '#demo-button' }),
+          (result) => result.elements.length === 1,
+        )
+      ).elements[0];
+      const stats = async () => {
+        const result = await page.call('Runtime.evaluate', {
+          expression: `(()=>{const el=document.querySelector('#demo-button');const animations=el.getAnimations();return{css:el.style.cssText,sitePresent:animations.includes(window.siteMotion),siteState:window.siteMotion.playState,transform:getComputedStyle(el).transform,owned:animations.filter(a=>a.id.startsWith('workbench-preview:')).map(a=>({state:a.playState,time:a.currentTime,keyframes:a.effect.getKeyframes()}))};})()`,
+          returnByValue: true,
+        });
+        return result.result.value as {
+          css: string;
+          sitePresent: boolean;
+          siteState: string;
+          transform: string;
+          owned: Array<{
+            state: string;
+            time: number | null;
+            keyframes: Array<Record<string, unknown>>;
+          }>;
+        };
+      };
+      const before = await stats();
+      runtime.startRecording();
+      runtime.allowAgentControl();
+      const changes = {
+        styles: {
+          'background-image': 'linear-gradient(135deg, #e34b56 0%, #981b42 100%)',
+          'box-shadow': '0 10px 24px rgba(40, 12, 25, 0.3)',
+        },
+        animation,
+      };
+      const result = await runtime.callTool('workbench_browser_edit', {
+        ref: element.ref,
+        ...changes,
+      });
+      assert(!result.isError, result.text);
+      const edit = JSON.parse(result.text);
+      assert.match(edit.element.computed['background-image'], /linear-gradient/);
+      assert.notEqual(edit.element.computed['box-shadow'], 'none');
+      assert.equal(edit.element.animationState, 'running');
+      assert.deepEqual(edit.element.animation, animation);
+      assert.deepEqual(
+        runtime.getState().previewEdits?.find((item) => item.editId === edit.editId)?.changes
+          .animation,
+        animation,
+      );
+      const moving = await waitFor(
+        stats,
+        (value) =>
+          value.owned.length === 1 &&
+          value.owned[0].state === 'running' &&
+          Number(value.owned[0].time) > 0,
+      );
+      assert(moving.sitePresent && moving.siteState === 'running');
+      assert(moving.owned[0].keyframes.some((frame) => String(frame.transform).includes('-6px')));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const later = await stats();
+      assert(
+        Number(later.owned[0].time) > Number(moving.owned[0].time),
+        'Native WAAPI time must actually advance',
+      );
+      assert.notEqual(later.transform, 'none');
+      const recorded = await waitFor(
+        async () => steps.find((step) => step.kind === 'edit' && step.editId === edit.editId),
+        Boolean,
+      );
+      assert.deepEqual(JSON.parse(recorded!.value!).animation, animation);
+      const undo = await runtime.callTool('workbench_browser_undo', { editId: edit.editId });
+      assert(!undo.isError, undo.text);
+      const restored = await stats();
+      assert.equal(restored.css, before.css);
+      assert.equal(restored.owned.length, 0);
+      assert(
+        restored.sitePresent && restored.siteState === 'running',
+        'Undo must preserve the website-owned Animation',
+      );
+
+      const motion = await runtime.editElement(element.ref, { animation });
+      const stop = await runtime.editElement(element.ref, { animation: null });
+      assert.equal((await stats()).owned.length, 0);
+      assert.equal(stop.element.animation, null);
+      assert((await stats()).sitePresent);
+      const resumed = await runtime.undoEdit(stop.editId);
+      assert.deepEqual(resumed.element.animation, animation);
+      assert.equal((await stats()).owned.length, 1);
+      await runtime.undoEdit(motion.editId);
+
+      await page.call('Emulation.setEmulatedMedia', {
+        features: [{ name: 'prefers-reduced-motion', value: 'reduce' }],
+      });
+      const reduced = await runtime.editElement(element.ref, { animation });
+      assert.equal(reduced.element.animationState, 'reduced-motion');
+      assert.deepEqual(reduced.element.animation, animation);
+      assert.equal(
+        (await stats()).owned.length,
+        0,
+        'Reduced-motion must not be reported as playing',
+      );
+      assert((await stats()).sitePresent);
+      await runtime.undoEdit(reduced.editId);
+
+      for (const bad of [
+        { ...animation, duration: 0 },
+        { ...animation, keyframes: [animation.keyframes[0]] },
+        {
+          ...animation,
+          keyframes: [
+            { offset: 0.8, styles: { opacity: '0.2' } },
+            { offset: 0.2, styles: { opacity: '1' } },
+          ],
+        },
+        { ...animation, easing: 'steps(1, jump-none)' },
+        {
+          ...animation,
+          keyframes: [{ styles: { opacity: 'var(--private)' } }, { styles: { opacity: '1' } }],
+        },
+        {
+          ...animation,
+          keyframes: [
+            { styles: { transform: 'translateY(0px) !important' } },
+            { styles: { transform: 'translateY(2px)' } },
+          ],
+        },
+      ]) {
+        runtime.allowAgentControl();
+        const rejected = await runtime.callTool('workbench_browser_edit', {
+          ref: element.ref,
+          styles: { color: 'red' },
+          animation: bad,
+        });
+        assert(rejected.isError, 'Invalid animation must reject the whole combined patch');
+        assert.equal((await stats()).css, before.css);
+      }
+      const blocked = await runtime.callTool('workbench_browser_edit', {
+        ref: element.ref,
+        styles: { 'background-image': 'url(https://invalid.test/never-fetch)' },
+      });
+      assert(blocked.isError);
+      assert.equal((await stats()).css, before.css);
+      runtime.stopRecording();
+      await runtime.reload();
+      runtime.allowAgentControl();
+      assert(
+        (await runtime.callTool('workbench_browser_edit', { ref: element.ref, animation })).isError,
+        'A stale ref must not animate a replacement document',
+      );
+    } finally {
+      await runtime.dispose();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(storageDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  },
+);
 test(
   'real BrowserOS neo: cross-origin frames and open shadows keep exact element scope',
   { skip: !binary, timeout: 50_000 },
@@ -429,6 +742,33 @@ test(
         'Popup must not silently retarget ongoing Agent operations',
       );
       assert.equal(runtime.getState().url, `${origin}/a`);
+      const activePage = (runtime as any).tabs.get(tabA).page;
+      const visibility = await activePage.call('Runtime.evaluate', {
+        expression: 'document.visibilityState',
+        returnByValue: true,
+      });
+      assert.equal(
+        visibility.result.value,
+        'visible',
+        'A background popup must not hide the embedded active page',
+      );
+      const beforePopupPaint = frames.length;
+      const status = (await runtime.queryElements({ selector: '#status' })).elements[0];
+      assert(
+        !(
+          await runtime.callTool('workbench_browser_edit', {
+            ref: status.ref,
+            text: 'Popup kept the first page visible',
+          })
+        ).isError,
+      );
+      await until(
+        async () =>
+          frames
+            .slice(beforePopupPaint)
+            .some((frame) => frame.tabId === tabA && Boolean(frame.data)),
+        Boolean,
+      );
       await runtime.switchTab(popupTab.id);
       await until(heading, (value) => value.elements[0]?.text === 'Popup heading');
       await runtime.closeTab(popupTab.id);

@@ -23,6 +23,15 @@ interface Details extends ElementInfo {
   attributes: Record<string, string>;
   computed: Record<string, string>;
   ancestors: ElementInfo[];
+  animation?: AnimationConfig | null;
+  animationState?: 'running' | 'paused' | 'finished' | 'idle' | 'reduced-motion';
+}
+interface AnimationConfig {
+  keyframes: Array<{ offset?: number; styles: Record<string, string> }>;
+  duration: number;
+  iterations?: number | 'infinite';
+  easing?: string;
+  direction?: 'normal' | 'reverse' | 'alternate' | 'alternate-reverse';
 }
 interface QueryResult {
   documentId: string;
@@ -84,7 +93,10 @@ async function bridge<T>(page: Page, method: string, ...args: unknown[]): Promis
 }
 
 async function fixture(t: TestContext) {
-  const context = await browser!.newContext({ viewport: { width: 1200, height: 1000 } });
+  const context = await browser!.newContext({
+    viewport: { width: 1200, height: 1000 },
+    reducedMotion: 'no-preference',
+  });
   t.after(() => context.close());
   const page = await context.newPage();
   const events: PageEvent[] = [];
@@ -127,6 +139,363 @@ async function eventually(condition: () => boolean) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
+
+const redGradient = 'linear-gradient(135deg,#d9363e 0%,#c41e3a 55%,#9f1239 100%)';
+const breathing: AnimationConfig = {
+  keyframes: [
+    { offset: 0, styles: { transform: 'translateY(0px) scale(1)', opacity: '0.9' } },
+    { offset: 0.5, styles: { transform: 'translateY(-8px) scale(1.04)', opacity: '1' } },
+    { offset: 1, styles: { transform: 'translateY(0px) scale(1)', opacity: '0.9' } },
+  ],
+  duration: 1600,
+  iterations: 'infinite',
+  easing: 'ease-in-out',
+};
+
+async function visualFixture(t: TestContext) {
+  const f = await fixture(t);
+  await f.page.evaluate(() => {
+    const button = document.createElement('button');
+    button.id = 'visual-button';
+    button.textContent = '开始';
+    button.style.cssText =
+      'background:linear-gradient(90deg,#123abc,#2563eb);box-shadow:0 2px 4px rgba(0,0,0,.2)';
+    document.body.prepend(button);
+  });
+  return { ...f, button: await f.find('#visual-button') };
+}
+
+test(
+  'safe gradient shorthand and box-shadow replace an existing gradient and undo exactly',
+  { skip: !executable },
+  async (t) => {
+    const { page, button } = await visualFixture(t);
+    const original = await page
+      .locator('#visual-button')
+      .evaluate((el) => (el as HTMLElement).style.cssText);
+    const result = await bridge<EditResult>(page, 'edit', {
+      ref: button.ref,
+      styles: { background: redGradient, 'box-shadow': '0 8px 24px rgba(217,36,62,.35)' },
+    });
+    assert.match(
+      result.element.computed['background-image'],
+      /linear-gradient.*rgb\(217, 54, 62\)/,
+    );
+    assert.match(result.element.computed['box-shadow'], /24px/);
+    await bridge(page, 'undo', result.editId);
+    assert.equal(
+      await page.locator('#visual-button').evaluate((el) => (el as HTMLElement).style.cssText),
+      original,
+    );
+  },
+);
+
+test(
+  'safe background-image gradient can replace the image hiding a plain background-color',
+  { skip: !executable },
+  async (t) => {
+    const { page, button } = await visualFixture(t);
+    await bridge(page, 'edit', { ref: button.ref, styles: { 'background-color': '#d9363e' } });
+    assert.match(
+      await page.locator('#visual-button').evaluate((el) => getComputedStyle(el).backgroundImage),
+      /rgb\(18, 58, 188\)/,
+    );
+    const result = await bridge<EditResult>(page, 'edit', {
+      ref: button.ref,
+      styles: { 'background-image': redGradient },
+    });
+    assert.match(result.element.computed['background-image'], /rgb\(217, 54, 62\)/);
+  },
+);
+
+test(
+  'structured owned animation runs and undo leaves a pre-existing website animation untouched',
+  { skip: !executable },
+  async (t) => {
+    const { page, button } = await visualFixture(t);
+    await page.evaluate(() => {
+      (globalThis as any).siteAnimation = document
+        .querySelector('#visual-button')!
+        .animate([{ color: 'black' }, { color: 'white' }], {
+          duration: 4000,
+          iterations: Infinity,
+        });
+    });
+    const result = await bridge<EditResult>(page, 'edit', {
+      ref: button.ref,
+      animation: breathing,
+    });
+    assert.equal(result.element.animationState, 'running');
+    assert.equal(result.element.animation?.duration, 1600);
+    assert.equal(
+      await page.locator('#visual-button').evaluate((el) => el.getAnimations().length),
+      2,
+    );
+    await bridge(page, 'undo', result.editId);
+    assert.equal((await bridge<Details>(page, 'inspect', button.ref)).animation, null);
+    assert.equal(await page.evaluate(() => (globalThis as any).siteAnimation.playState), 'running');
+    assert.equal(
+      await page.locator('#visual-button').evaluate((el) => el.getAnimations().length),
+      1,
+    );
+  },
+);
+
+test(
+  'hyphenated animation styles become real WAAPI properties and inspect reports pause/finish',
+  { skip: !executable },
+  async (t) => {
+    const { page, button } = await visualFixture(t);
+    const animation: AnimationConfig = {
+      duration: 1000,
+      iterations: 'infinite',
+      keyframes: [
+        {
+          offset: 0,
+          styles: { 'box-shadow': '0px 0px 0px rgba(0,0,0,0)', 'background-color': 'rgb(255,0,0)' },
+        },
+        {
+          offset: 1,
+          styles: {
+            'box-shadow': '0px 10px 20px rgba(0,0,0,0.8)',
+            'background-color': 'rgb(0,0,255)',
+          },
+        },
+      ],
+    };
+    const edited = await bridge<EditResult>(page, 'edit', { ref: button.ref, animation });
+    const evidence = await page.locator('#visual-button').evaluate(async (el) => {
+      const player = el.getAnimations().find((item) => item.id.startsWith('workbench-preview:'))!;
+      player.pause();
+      await player.ready;
+      player.currentTime = 500;
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      return {
+        keyframes: (player.effect as KeyframeEffect).getKeyframes(),
+        color: getComputedStyle(el).backgroundColor,
+        shadow: getComputedStyle(el).boxShadow,
+      };
+    });
+    assert(
+      evidence.keyframes.every(
+        (frame) => typeof frame.boxShadow === 'string' && typeof frame.backgroundColor === 'string',
+      ),
+    );
+    assert.equal(
+      evidence.keyframes.some((frame) => 'box-shadow' in frame || 'background-color' in frame),
+      false,
+    );
+    assert.notEqual(evidence.color, 'rgb(255, 0, 0)');
+    assert.notEqual(evidence.color, 'rgb(0, 0, 255)');
+    assert.match(evidence.shadow, /10px/);
+    assert.equal((await bridge<Details>(page, 'inspect', button.ref)).animationState, 'paused');
+    await bridge(page, 'undo', edited.editId);
+    const finite = await bridge<EditResult>(page, 'edit', {
+      ref: button.ref,
+      animation: { ...breathing, duration: 100, iterations: 1 },
+    });
+    await page.locator('#visual-button').evaluate(async (el) => {
+      await el.getAnimations().find((item) => item.id.startsWith('workbench-preview:'))!.finished;
+    });
+    assert.equal((await bridge<Details>(page, 'inspect', button.ref)).animationState, 'finished');
+    await bridge(page, 'undo', finite.editId);
+  },
+);
+
+test(
+  'stop and nested animation undo restore only previous tool-owned playback and record the config',
+  { skip: !executable },
+  async (t) => {
+    const { page, button, events } = await visualFixture(t);
+    await page.evaluate(() => {
+      (globalThis as any).siteAnimation = document
+        .querySelector('#visual-button')!
+        .animate([{ color: 'black' }, { color: 'white' }], {
+          duration: 4000,
+          iterations: Infinity,
+        });
+    });
+    const first = await bridge<EditResult>(page, 'edit', { ref: button.ref, animation: breathing });
+    const second = await bridge<EditResult>(page, 'edit', {
+      ref: button.ref,
+      animation: { ...breathing, duration: 800, direction: 'alternate' },
+    });
+    await assert.rejects(bridge(page, 'undo', first.editId), /newer animation/);
+    assert.equal(
+      (await bridge<EditResult>(page, 'undo', second.editId)).element.animation?.duration,
+      1600,
+    );
+    const stopped = await bridge<EditResult>(page, 'edit', { ref: button.ref, animation: null });
+    assert.equal(stopped.element.animation, null);
+    assert.equal(stopped.element.animationState, 'idle');
+    assert.equal(
+      await page.locator('#visual-button').evaluate((el) => el.getAnimations().length),
+      1,
+    );
+    const restored = await bridge<EditResult>(page, 'undo', stopped.editId);
+    assert.equal(restored.element.animation?.duration, 1600);
+    assert.equal(restored.element.animationState, 'running');
+    await bridge(page, 'undo', first.editId);
+    assert.equal(
+      await page.locator('#visual-button').evaluate((el) => el.getAnimations().length),
+      1,
+    );
+    assert.equal(await page.evaluate(() => (globalThis as any).siteAnimation.playState), 'running');
+    await eventually(() => events.filter((event) => event.kind === 'edit').length === 3);
+    const changes = events
+      .filter((event) => event.kind === 'edit')
+      .map((event) => JSON.parse(event.value!));
+    assert.equal(changes[0].animation.keyframes.length, 3);
+    assert.equal(changes[0].animation.duration, 1600);
+    assert.equal(changes[2].animation, null);
+  },
+);
+
+test(
+  'reduced motion preserves the requested config without falsely claiming it is playing',
+  { skip: !executable },
+  async (t) => {
+    const { page, button } = await visualFixture(t);
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    const edit = await bridge<EditResult>(page, 'edit', {
+      ref: button.ref,
+      styles: { background: redGradient },
+      animation: breathing,
+    });
+    assert.equal(edit.element.animationState, 'reduced-motion');
+    assert.equal(edit.element.animation?.duration, 1600);
+    assert.equal(
+      await page.locator('#visual-button').evaluate((el) => el.getAnimations().length),
+      0,
+    );
+    assert.match(edit.element.computed['background-image'], /rgb\(217, 54, 62\)/);
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    await page.waitForFunction(
+      (ref) => (globalThis as any).__workbenchPage.inspect(ref).animationState === 'running',
+      button.ref,
+    );
+    assert.equal(
+      await page.locator('#visual-button').evaluate((el) => el.getAnimations().length),
+      1,
+    );
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.waitForFunction(
+      (ref) => (globalThis as any).__workbenchPage.inspect(ref).animationState === 'reduced-motion',
+      button.ref,
+    );
+    assert.equal(
+      await page.locator('#visual-button').evaluate((el) => el.getAnimations().length),
+      0,
+    );
+    await bridge(page, 'undo', edit.editId);
+    assert.equal((await bridge<Details>(page, 'inspect', button.ref)).animation, null);
+  },
+);
+
+test(
+  'visual CSS and animation reject unsafe payloads atomically',
+  { skip: !executable },
+  async (t) => {
+    const { page, button } = await visualFixture(t);
+    const original = await page
+      .locator('#visual-button')
+      .evaluate((el) => (el as HTMLElement).style.cssText);
+    const invalidStyles = [
+      { background: 'url(https://invalid.test/image)' },
+      { 'background-image': 'image-set(url(https://invalid.test/image) 1x)' },
+      { 'background-image': '-webkit-image-set("https://invalid.test/image" 1x)' },
+      { 'background-image': 'paint(untrusted)' },
+      { 'background-image': 'image("https://invalid.test/image")' },
+      { background: 'var(--private)' },
+      { background: 'attr(data-private)' },
+      { filter: 'url(#private)' },
+      { filter: 'expression(alert(1))' },
+      { background: 'u\\72l(https://invalid.test/image)' },
+      { background: 'linear-gradient(red,blue);color:red' },
+      { background: 'linear-gradient(red,blue)/*comment*/' },
+      { color: 'red !important' },
+    ];
+    for (const styles of invalidStyles)
+      await assert.rejects(
+        bridge(page, 'edit', { ref: button.ref, styles: { color: 'red', ...styles } }),
+        /Unsupported/,
+      );
+    const invalidAnimations: unknown[] = [
+      { ...breathing, keyframes: [breathing.keyframes[0]] },
+      { ...breathing, keyframes: Array.from({ length: 13 }, () => breathing.keyframes[0]) },
+      { ...breathing, duration: 99 },
+      { ...breathing, duration: 60001 },
+      { ...breathing, iterations: 0 },
+      { ...breathing, iterations: 101 },
+      { ...breathing, easing: 'cubic-bezier(2,0,1,1)' },
+      { ...breathing, easing: 'steps(0)' },
+      { ...breathing, easing: 'steps(1,jump-none)' },
+      { ...breathing, easing: 'steps(1001)' },
+      { ...breathing, direction: 'sideways' },
+      {
+        ...breathing,
+        keyframes: [
+          { offset: 0.8, styles: { opacity: '0.5' } },
+          { offset: 0.2, styles: { opacity: '1' } },
+        ],
+      },
+      {
+        ...breathing,
+        keyframes: [{ styles: { background: redGradient } }, { styles: { opacity: '1' } }],
+      },
+      {
+        ...breathing,
+        keyframes: [{ styles: { filter: 'url(#unsafe)' } }, { styles: { filter: 'none' } }],
+      },
+      { ...breathing, keyframes: [{ styles: {} }, { styles: { opacity: '1' } }] },
+    ];
+    for (const animation of invalidAnimations)
+      await assert.rejects(
+        bridge(page, 'edit', { ref: button.ref, styles: { color: 'red' }, animation }),
+      );
+    assert.equal(
+      await page.locator('#visual-button').evaluate((el) => (el as HTMLElement).style.cssText),
+      original,
+    );
+    assert.equal(
+      await page.locator('#visual-button').evaluate((el) => el.getAnimations().length),
+      0,
+    );
+  },
+);
+
+test(
+  'animation preview preserves sensitive/stale-ref and undo conflict protections',
+  { skip: !executable },
+  async (t) => {
+    const { page, button, find } = await visualFixture(t);
+    const sensitive = await find('#password-input');
+    await assert.rejects(
+      bridge(page, 'edit', { ref: sensitive.ref, animation: breathing }),
+      /Sensitive/,
+    );
+    const edit = await bridge<EditResult>(page, 'edit', { ref: button.ref, animation: breathing });
+    await page.locator('#visual-button').evaluate((el) => {
+      const player = el.getAnimations().find((item) => item.id.startsWith('workbench-preview:'))!;
+      (player.effect as KeyframeEffect).updateTiming({ duration: 2000 });
+    });
+    await assert.rejects(bridge(page, 'undo', edit.editId), /animation changed/);
+    await page.locator('#visual-button').evaluate((el) => {
+      (globalThis as any).ownedBeforeRemoval = el
+        .getAnimations()
+        .find((item) => item.id.startsWith('workbench-preview:'));
+      el.remove();
+    });
+    await assert.rejects(
+      bridge(page, 'edit', { ref: button.ref, animation: null }),
+      /stale|removed/,
+    );
+    assert.equal(
+      await page.evaluate(() => (globalThis as any).ownedBeforeRemoval.playState),
+      'idle',
+    );
+  },
+);
 
 test(
   'reveal scrolls an offscreen non-interactive node without requiring it to receive pointer events',

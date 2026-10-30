@@ -1,3 +1,11 @@
+import {
+  ELEMENT_STYLE_PROPERTIES,
+  ELEMENT_ANIMATION_PROPERTIES,
+  ELEMENT_BACKGROUND_FUNCTIONS,
+  ELEMENT_PREVIEW_LIMITS,
+  ELEMENT_UNSAFE_CSS_PATTERN,
+} from '../shared/types';
+
 // Keep this as plain JavaScript: the isolated world must not depend on bundler helpers.
 export const browserPageSource = String.raw`(() => {
   if (globalThis.__workbenchPage) return;
@@ -8,14 +16,21 @@ export const browserPageSource = String.raw`(() => {
   const overlays = new WeakSet();
   const patches = new Map();
   const editOrder = [];
+  const ownedAnimations = new Map();
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
   const textLimit = 20000;
-  const styleNames = ['color','background-color','font-size','font-weight','font-style','line-height','letter-spacing','text-align','text-decoration','white-space','margin','margin-top','margin-right','margin-bottom','margin-left','padding','padding-top','padding-right','padding-bottom','padding-left','border','border-color','border-width','border-style','border-radius','width','height','min-width','min-height','max-width','max-height','display','opacity','gap','row-gap','column-gap','flex-direction','justify-content','align-items'];
+  const styleNames = ${JSON.stringify(ELEMENT_STYLE_PROPERTIES)};
+  const limits = ${JSON.stringify(ELEMENT_PREVIEW_LIMITS)};
+  const unsafeCss = new RegExp(${JSON.stringify(ELEMENT_UNSAFE_CSS_PATTERN)},'i');
   const editableStyles = new Set(styleNames);
+  const animationStyles = new Set(${JSON.stringify(ELEMENT_ANIMATION_PROPERTIES)});
+  const backgroundFunctions = new Set(${JSON.stringify(ELEMENT_BACKGROUND_FUNCTIONS)});
   const attributeNames = new Set(['id','class','role','aria-label','aria-labelledby','aria-describedby','aria-hidden','aria-expanded','aria-checked','aria-selected','title','alt','name','type','placeholder','data-testid','tabindex','disabled','readonly']);
   const blockedTextTags = new Set(['SCRIPT','STYLE','NOSCRIPT','TEMPLATE','HEAD','META','LINK','BASE','INPUT','TEXTAREA','SELECT','OPTION','IMG','IFRAME','OBJECT','EMBED','VIDEO','AUDIO','CANVAS','HTML','BODY','SVG','PATH','RECT','CIRCLE']);
   const blockedEditTags = new Set(['SCRIPT','STYLE','NOSCRIPT','TEMPLATE','HEAD','META','LINK','BASE','OBJECT','EMBED']);
   let nextId = 0;
   let nextEditId = 0;
+  let nextAnimationId = 0;
   let source = 'human';
   let maskNodes = [];
   let outline;
@@ -37,6 +52,8 @@ export const browserPageSource = String.raw`(() => {
       const current=pending.pop();
       const ref=ids.get(current);
       if (ref) { elements.delete(ref); ids.delete(current); }
+      ownedAnimations.get(current)?.player?.cancel();
+      ownedAnimations.delete(current);
       pending.push(...current.children);
       if (current.shadowRoot) {
         observers.get(current.shadowRoot)?.disconnect();
@@ -185,17 +202,111 @@ export const browserPageSource = String.raw`(() => {
     if (text.length>textLimit || clean(text,textLimit+1)!==text) return {editableText:false,editReason:'This text exceeds 20000 characters or contains sensitive content.'};
     return {editableText:true};
   }
+  function validateStyles(value, animated=false) {
+    if (!value || typeof value!=='object' || Array.isArray(value)) throw new Error('Invalid style changes');
+    const entries=Object.entries(value);
+    if (entries.length>limits.styleCount || (animated && !entries.length)) throw new Error('Invalid number of style changes');
+    const output={};
+    for (const [name,raw] of entries) {
+      if (!(animated ? animationStyles : editableStyles).has(name) || typeof raw!=='string' || raw.length>limits.styleValueLength) throw new Error('Unsupported CSS property or value: '+name);
+      const text=raw.trim();
+      if ((animated && !text) || unsafeCss.test(text) || (text!=='' && !CSS.supports(name,text))) throw new Error('Unsupported CSS property or value: '+name);
+      if (name==='background' || name==='background-image') for (const match of text.matchAll(/([a-z_-][a-z0-9_-]*)\s*\(/gi)) if (!backgroundFunctions.has(match[1].toLowerCase())) throw new Error('Unsupported background image function');
+      output[name]=text;
+    }
+    return output;
+  }
+  function validEasing(value) {
+    if (typeof value!=='string' || value.length>limits.easingLength || unsafeCss.test(value)) return false;
+    const easing=value.trim().toLowerCase();
+    if (/^(linear|ease|ease-in|ease-out|ease-in-out|step-start|step-end)$/.test(easing)) return true;
+    const bezier=easing.match(/^cubic-bezier\(([^()]*)\)$/);
+    if (bezier) {
+      const parts=bezier[1].split(',').map(part=>part.trim());
+      const numbers=parts.map(Number);
+      return parts.length===4 && parts.every(Boolean) && numbers.every(Number.isFinite) && numbers[0]>=0 && numbers[0]<=1 && numbers[2]>=0 && numbers[2]<=1 && CSS.supports('animation-timing-function',easing);
+    }
+    const steps=easing.match(/^steps\(\s*(\d+)\s*(?:,\s*(start|end|jump-start|jump-end|jump-none|jump-both))?\s*\)$/);
+    return !!steps && Number(steps[1])>=1 && Number(steps[1])<=limits.stepsMax && !(steps[2]==='jump-none' && Number(steps[1])<2) && CSS.supports('animation-timing-function',easing);
+  }
+  function normalizeAnimation(value) {
+    if (value===null) return null;
+    if (!value || typeof value!=='object' || Array.isArray(value) || Object.keys(value).some(key=>!['keyframes','duration','iterations','easing','direction'].includes(key))) throw new Error('Invalid preview animation configuration');
+    if (!Array.isArray(value.keyframes) || value.keyframes.length<limits.keyframesMin || value.keyframes.length>limits.keyframesMax) throw new Error('Animation requires 2 to 12 keyframes');
+    if (typeof value.duration!=='number' || !Number.isFinite(value.duration) || value.duration<limits.durationMin || value.duration>limits.durationMax) throw new Error('Animation duration must be between 100 and 60000ms');
+    const iterations=value.iterations ?? 1;
+    if (iterations!=='infinite' && (typeof iterations!=='number' || !Number.isFinite(iterations) || iterations<1 || iterations>limits.iterationsMax)) throw new Error('Animation iterations must be 1 to 100 or infinite');
+    const easing=value.easing ?? 'linear';
+    if (!validEasing(easing)) throw new Error('Unsupported animation easing');
+    const direction=value.direction ?? 'normal';
+    if (!['normal','reverse','alternate','alternate-reverse'].includes(direction)) throw new Error('Invalid animation direction');
+    let lastOffset=-1;
+    const keyframes=value.keyframes.map(frame=> {
+      if (!frame || typeof frame!=='object' || Array.isArray(frame) || Object.keys(frame).some(key=>!['offset','styles'].includes(key))) throw new Error('Invalid animation keyframe');
+      if (frame.offset!==undefined) {
+        if (typeof frame.offset!=='number' || !Number.isFinite(frame.offset) || frame.offset<0 || frame.offset>1 || frame.offset<lastOffset) throw new Error('Keyframe offsets must be ordered between 0 and 1');
+        lastOffset=frame.offset;
+      }
+      return {...(frame.offset===undefined ? {} : {offset:frame.offset}),styles:validateStyles(frame.styles,true)};
+    });
+    return {keyframes,duration:value.duration,iterations,easing:easing.trim(),direction};
+  }
+  const clone = value => value===null ? null : JSON.parse(JSON.stringify(value));
+  function animationSnapshot(record) {
+    if (!record) return null;
+    return {token:record.token,config:clone(record.config),currentTime:record.player ? record.player.currentTime : record.currentTime,playState:record.player ? record.player.playState : record.playState,playbackRate:record.player ? record.player.playbackRate : record.playbackRate};
+  }
+  function prepareAnimation(el,config,snapshot,token={}) {
+    const record={token,config:clone(config),player:null,effect:null,currentTime:snapshot?.currentTime ?? 0,playState:snapshot?.playState || (config ? 'running' : 'idle'),playbackRate:snapshot?.playbackRate ?? 1};
+    if (config && !reducedMotion.matches) {
+      const frames=config.keyframes.map(frame=> {
+        const result={...(frame.offset===undefined ? {} : {offset:frame.offset})};
+        for (const [name,value] of Object.entries(frame.styles)) result[name.replace(/-([a-z])/g,(_,letter)=>letter.toUpperCase())]=value;
+        return result;
+      });
+      record.effect=new KeyframeEffect(el,frames,{duration:config.duration,iterations:config.iterations==='infinite' ? Infinity : config.iterations,easing:config.easing,direction:config.direction,fill:'none'});
+      record.player=new Animation(record.effect,document.timeline);
+      record.player.id='workbench-preview:'+docId+':'+(++nextAnimationId);
+      record.keyframesSignature=JSON.stringify(record.effect.getKeyframes());
+      record.timingSignature=JSON.stringify(record.effect.getTiming());
+    }
+    return record;
+  }
+  function checkAnimation(record) {
+    if (!record?.player) return;
+    if (record.player.effect!==record.effect || JSON.stringify(record.effect.getKeyframes())!==record.keyframesSignature || JSON.stringify(record.effect.getTiming())!==record.timingSignature) throw new Error('Page animation changed after this edit; refusing to overwrite newer changes');
+  }
+  function applyAnimation(el,record) {
+    ownedAnimations.get(el)?.player?.cancel();
+    if (!record) { ownedAnimations.delete(el); return; }
+    ownedAnimations.set(el,record);
+    if (!record.player) return;
+    record.player.playbackRate=record.playbackRate;
+    if (record.playState==='running') record.player.play();
+    else if (record.playState==='paused') record.player.pause();
+    else if (record.playState==='finished') record.player.finish();
+    if (record.playState!=='idle' && typeof record.currentTime==='number') record.player.currentTime=record.currentTime;
+  }
+  reducedMotion.addEventListener('change',()=> {
+    for (const [el,record] of ownedAnimations) {
+      if (!el.isConnected) { record.player?.cancel(); ownedAnimations.delete(el); continue; }
+      if (!record.config) continue;
+      const saved=animationSnapshot(record);
+      applyAnimation(el,prepareAnimation(el,record.config,saved,record.token));
+    }
+  });
   function inspect(ref) {
     const el=resolve(ref);
     const attributes={};
     for (const attribute of el.attributes) if (attributeNames.has(attribute.name)) attributes[attribute.name]=sensitive(el) && !['type','role','disabled','readonly','tabindex'].includes(attribute.name) ? '[hidden]' : clean(attribute.value,512);
     const computed={};
     const style=getComputedStyle(el);
-    for (const name of styleNames) computed[name]=clean(style.getPropertyValue(name),256);
+    for (const name of styleNames) computed[name]=clean(style.getPropertyValue(name),2000);
     const ancestors=[];
     for (let node=parent(el); node && ancestors.length<8; node=parent(node)) ancestors.push(describe(node));
     const textContent=sensitive(el) ? '[hidden]' : el.children.length || el.shadowRoot ? safeText(el,textLimit) : clean(leafText(el),textLimit);
-    return {...describe(el),textContent,...textEditState(el),attributes,computed,ancestors};
+    const animation=ownedAnimations.get(el);
+    return {...describe(el),textContent,...textEditState(el),attributes,computed,ancestors,animation:animation?.config ? clone(animation.config) : null,animationState:animation?.config ? reducedMotion.matches && !animation.player ? 'reduced-motion' : animation.player?.playState || 'idle' : 'idle'};
   }
   document.addEventListener('click', event=> {
     if (!event.isTrusted && source!=='agent') return;
@@ -264,20 +375,20 @@ export const browserPageSource = String.raw`(() => {
     },
     atPoint(x,y) { const el=atPoint(x,y); return el ? describe(el) : null; },
     edit(request) {
-      if (!request || typeof request!=='object' || Array.isArray(request) || Object.keys(request).some(key=>!['ref','text','styles'].includes(key))) throw new Error('Only text and supported styles can be edited');
+      if (!request || typeof request!=='object' || Array.isArray(request) || Object.keys(request).some(key=>!['ref','text','styles','animation'].includes(key))) throw new Error('Only text, supported styles and a preview animation can be edited');
       const el=resolve(request.ref);
       if (sensitive(el) || blockedEditTags.has(el.localName.toUpperCase())) throw new Error('Sensitive or executable elements cannot be edited');
       const hasText=Object.hasOwn(request,'text');
       if (hasText && (typeof request.text!=='string' || request.text.length>textLimit || clean(request.text,textLimit+1)!==request.text)) throw new Error('Invalid or sensitive replacement text');
       if (hasText) { const state=textEditState(el); if (!state.editableText) throw new Error(state.editReason); }
-      const styles=request.styles===undefined ? {} : request.styles;
-      if (!styles || typeof styles!=='object' || Array.isArray(styles)) throw new Error('Invalid style changes');
+      const styles=request.styles===undefined ? {} : validateStyles(request.styles);
       const entries=Object.entries(styles);
-      if (!hasText && !entries.length) throw new Error('No preview changes were provided');
-      if (entries.length>40) throw new Error('Too many style changes');
-      for (const [name,value] of entries) {
-        if (!editableStyles.has(name) || typeof value!=='string' || value.length>200 || /url\s*\(|expression\s*\(|var\s*\(|javascript\s*:|@|[;{}<>\\]/i.test(value) || (value!=='' && !CSS.supports(name,value))) throw new Error('Unsupported CSS property or value: '+name);
-      }
+      const hasAnimation=Object.hasOwn(request,'animation');
+      if (!hasText && !entries.length && !hasAnimation) throw new Error('No preview changes were provided');
+      const animation=hasAnimation ? normalizeAnimation(request.animation) : undefined;
+      if (hasAnimation) checkAnimation(ownedAnimations.get(el));
+      const beforeAnimation=hasAnimation ? animationSnapshot(ownedAnimations.get(el)) : undefined;
+      const prepared=hasAnimation ? prepareAnimation(el,animation) : undefined;
       const textNodes=hasText ? [...el.childNodes].filter(node=>node.nodeType===Node.TEXT_NODE) : [];
       const beforeText=textNodes.map(node=>node.nodeValue);
       const created=hasText && textNodes.length===0;
@@ -285,10 +396,11 @@ export const browserPageSource = String.raw`(() => {
       if (created) { const node=document.createTextNode(''); el.appendChild(node); textNodes.push(node); }
       if (hasText) textNodes.forEach((node,index)=> { node.nodeValue=index===0 ? request.text : ''; });
       for (const [name,value] of entries) value==='' ? el.style.removeProperty(name) : el.style.setProperty(name,value);
+      if (hasAnimation) applyAnimation(el,prepared);
       const editId=docId+':edit:'+(++nextEditId);
-      patches.set(editId,{ref:request.ref,el,textNodes,beforeText,created,hasText,afterText:textNodes.map(node=>node.nodeValue),hasStyles:entries.length>0,beforeCssText,afterCssText:el.style.cssText});
+      patches.set(editId,{ref:request.ref,el,textNodes,beforeText,created,hasText,afterText:textNodes.map(node=>node.nodeValue),hasStyles:entries.length>0,beforeCssText,afterCssText:el.style.cssText,hasAnimation,beforeAnimation,afterAnimationToken:prepared?.token});
       editOrder.push(editId);
-      send({kind:'edit',target:describe(el),editId,value:JSON.stringify({...(hasText ? {text:request.text} : {}),...(entries.length ? {styles} : {})})});
+      send({kind:'edit',target:describe(el),editId,value:JSON.stringify({...(hasText ? {text:request.text} : {}),...(entries.length ? {styles} : {}),...(hasAnimation ? {animation} : {})})});
       return {editId,element:inspect(request.ref)};
     },
     undo(editId) {
@@ -302,11 +414,19 @@ export const browserPageSource = String.raw`(() => {
         if (el.children.length || current.length!==patch.textNodes.length || current.some((node,index)=>node!==patch.textNodes[index] || node.nodeValue!==patch.afterText[index])) throw new Error('Page text changed after this edit; refusing to overwrite newer changes');
       }
       if (patch.hasStyles && el.style.cssText!==patch.afterCssText) throw new Error('Page styles changed after this edit; refusing to overwrite newer changes');
+      let restoredAnimation;
+      if (patch.hasAnimation) {
+        const current=ownedAnimations.get(el);
+        if (current?.token!==patch.afterAnimationToken) throw new Error('Preview animation changed after this edit; undo the newer animation first');
+        checkAnimation(current);
+        restoredAnimation=patch.beforeAnimation ? prepareAnimation(el,patch.beforeAnimation.config,patch.beforeAnimation,patch.beforeAnimation.token) : null;
+      }
       if (patch.hasText) {
         if (patch.created) patch.textNodes[0].remove();
         else patch.textNodes.forEach((node,index)=> { node.nodeValue=patch.beforeText[index]; });
       }
       if (patch.hasStyles) el.style.cssText=patch.beforeCssText;
+      if (patch.hasAnimation) applyAnimation(el,restoredAnimation);
       patches.delete(id);
       editOrder.splice(editOrder.indexOf(id),1);
       send({kind:'undo',target:describe(el),editId:id,value:JSON.stringify({editId:id})});

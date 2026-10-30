@@ -574,7 +574,7 @@ export class CodexSession {
         }
       });
       await this.request('initialize', {
-        clientInfo: { name: 'agent_workbench', title: 'Agent Workbench', version: '0.2.1' },
+        clientInfo: { name: 'agent_workbench', title: 'Agent Workbench', version: '0.2.2' },
         capabilities: { experimentalApi: true },
       });
       checkCurrent();
@@ -731,11 +731,9 @@ export class CodexSession {
         };
         if (complete)
           call.output =
-            typeof item.aggregatedOutput === 'string'
+            typeof item.aggregatedOutput === 'string' && item.aggregatedOutput.length > 0
               ? item.aggregatedOutput.slice(-6000)
-              : item.success === false
-                ? '工具执行失败'
-                : previous?.output;
+              : previous?.output || (item.success === false ? '工具执行失败' : undefined);
         this.calls.set(item.id, call);
         this.emit({ type: 'tool', call });
         if (!complete) this.updateRequestStatus();

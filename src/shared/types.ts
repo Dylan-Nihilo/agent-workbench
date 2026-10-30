@@ -24,6 +24,110 @@ export interface ElementRef {
   shadowPath?: string[];
   bounds?: { x: number; y: number; width: number; height: number };
 }
+
+export const ELEMENT_STYLE_PROPERTIES = [
+  'color',
+  'background-color',
+  'font-size',
+  'font-weight',
+  'font-style',
+  'line-height',
+  'letter-spacing',
+  'text-align',
+  'text-decoration',
+  'white-space',
+  'margin',
+  'margin-top',
+  'margin-right',
+  'margin-bottom',
+  'margin-left',
+  'padding',
+  'padding-top',
+  'padding-right',
+  'padding-bottom',
+  'padding-left',
+  'border',
+  'border-color',
+  'border-width',
+  'border-style',
+  'border-radius',
+  'width',
+  'height',
+  'min-width',
+  'min-height',
+  'max-width',
+  'max-height',
+  'display',
+  'opacity',
+  'gap',
+  'row-gap',
+  'column-gap',
+  'flex-direction',
+  'justify-content',
+  'align-items',
+  'background',
+  'background-image',
+  'background-size',
+  'background-position',
+  'background-repeat',
+  'box-shadow',
+  'text-shadow',
+  'transform',
+  'transform-origin',
+  'filter',
+] as const;
+export const ELEMENT_ANIMATION_PROPERTIES = [
+  'transform',
+  'opacity',
+  'box-shadow',
+  'filter',
+  'color',
+  'background-color',
+] as const;
+export const ELEMENT_BACKGROUND_FUNCTIONS = [
+  'linear-gradient',
+  'radial-gradient',
+  'conic-gradient',
+  'repeating-linear-gradient',
+  'repeating-radial-gradient',
+  'repeating-conic-gradient',
+  'rgb',
+  'rgba',
+  'hsl',
+  'hsla',
+  'hwb',
+  'lab',
+  'lch',
+  'oklab',
+  'oklch',
+  'color',
+  'color-mix',
+  'light-dark',
+  'calc',
+  'min',
+  'max',
+  'clamp',
+] as const;
+export const ELEMENT_PREVIEW_LIMITS = {
+  styleCount: 30,
+  styleValueLength: 500,
+  keyframesMin: 2,
+  keyframesMax: 12,
+  durationMin: 100,
+  durationMax: 60_000,
+  iterationsMax: 100,
+  easingLength: 200,
+  stepsMax: 1000,
+} as const;
+export const ELEMENT_UNSAFE_CSS_PATTERN = String.raw`(?:url|image-set|-webkit-image-set|var|attr|paint|expression)\s*\(|javascript\s*:|!\s*important|\/\*|\*\/|@|[;{}<>\\]`;
+
+export interface ElementAnimation {
+  keyframes: Array<{ offset?: number; styles: Record<string, string> }>;
+  duration: number;
+  iterations?: number | 'infinite';
+  easing?: string;
+  direction?: 'normal' | 'reverse' | 'alternate' | 'alternate-reverse';
+}
 export interface ElementDetails extends ElementRef {
   documentId: string;
   textContent: string;
@@ -33,6 +137,8 @@ export interface ElementDetails extends ElementRef {
   computed: Record<string, string>;
   ancestors: ElementRef[];
   shadowPath: string[];
+  animation?: ElementAnimation | null;
+  animationState?: 'running' | 'paused' | 'finished' | 'idle' | 'reduced-motion';
 }
 export interface ElementQuery {
   selector?: string;
@@ -49,6 +155,7 @@ export interface ElementQueryResult {
 export interface ElementEdit {
   text?: string;
   styles?: Record<string, string>;
+  animation?: ElementAnimation | null;
 }
 export interface ElementEditResult {
   editId: string;

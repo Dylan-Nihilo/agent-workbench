@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { ArrowUpRight, Check, ChevronRight, Code2, Loader2, Search, Undo2, X } from 'lucide-react';
 import type {
+  ElementAnimation,
   ElementDetails,
   ElementEdit,
   ElementEditResult,
@@ -22,7 +23,36 @@ const fields = [
   ['margin', '外边距'],
   ['letter-spacing', '字间距'],
   ['opacity', '透明度'],
+  ['background-image', '背景 / 渐变'],
+  ['box-shadow', '阴影'],
+  ['transform', '变换'],
 ] as const;
+
+type MotionChoice = 'none' | 'custom' | 'breathe' | 'bounce' | 'breathe-bounce';
+function motionPreset(
+  choice: Exclude<MotionChoice, 'none' | 'custom'>,
+  duration: number,
+): ElementAnimation {
+  const breathe = choice !== 'bounce';
+  const bounce = choice !== 'breathe';
+  return {
+    keyframes: [
+      { offset: 0, styles: { transform: 'translateY(0px) scale(1)', opacity: '1' } },
+      {
+        offset: 0.5,
+        styles: {
+          transform: `translateY(${bounce ? '-5px' : '0px'}) scale(${breathe ? '1.04' : '1'})`,
+          opacity: breathe ? '0.94' : '1',
+        },
+      },
+      { offset: 1, styles: { transform: 'translateY(0px) scale(1)', opacity: '1' } },
+    ],
+    duration,
+    iterations: 'infinite',
+    easing: 'ease-in-out',
+    direction: 'normal',
+  };
+}
 
 export function ElementInspector({
   selected,
@@ -43,22 +73,28 @@ export function ElementInspector({
 }) {
   const [loadedDetails, setDetails] = useState<ElementDetails>();
   const details = loadedDetails?.ref === selected?.ref ? loadedDetails : undefined;
-  const [section, setSection] = useState<'text' | 'styles' | 'details'>('text');
+  const [section, setSection] = useState<'text' | 'styles' | 'motion' | 'details'>('text');
   const [searchKind, setSearchKind] = useState<'text' | 'selector'>('text');
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<ElementQueryResult>();
   const [text, setText] = useState('');
   const [styles, setStyles] = useState<Record<string, string>>({});
+  const [motion, setMotion] = useState<MotionChoice>('none');
+  const [duration, setDuration] = useState('1.8');
   const [busy, setBusy] = useState(false);
   const lastEdit = previews.at(-1);
   const [status, setStatus] = useState('');
   const request = useRef(0);
   const previousTab = useRef(tabId);
+  const syncedPreview = useRef('');
+  const dirtyRef = useRef(false);
 
   const load = (value: ElementDetails, resetSection = false) => {
     setDetails(value);
     setText(value.textContent);
     setStyles({});
+    setMotion(value.animation ? 'custom' : 'none');
+    setDuration(String((value.animation?.duration ?? 1800) / 1000));
     setStatus('');
     if (resetSection) setSection(value.editableText ? 'text' : 'styles');
   };
@@ -86,6 +122,15 @@ export function ElementInspector({
     };
   }, [selected?.ref, tabId, onAction]);
 
+  const originalDuration = details?.animation?.duration ?? 1800;
+  const durationMs =
+    duration === String(originalDuration / 1000) ? originalDuration : Number(duration) * 1000;
+  const validMotion =
+    motion === 'none' ||
+    (duration.trim() !== '' &&
+      Number.isFinite(durationMs) &&
+      durationMs >= 100 &&
+      durationMs <= 60_000);
   const changes = (): ElementEdit => {
     if (!details) return {};
     const changedStyles = Object.fromEntries(
@@ -93,12 +138,48 @@ export function ElementInspector({
         .filter(([key, value]) => value.trim() !== (details.computed[key] ?? ''))
         .map(([key, value]) => [key, value.trim()]),
     );
+    const animation =
+      motion === 'none'
+        ? null
+        : motion === 'custom'
+          ? details.animation
+            ? { ...details.animation, duration: durationMs }
+            : null
+          : motionPreset(motion, durationMs);
     return {
       ...(details.editableText && text !== details.textContent ? { text } : {}),
       ...(Object.keys(changedStyles).length ? { styles: changedStyles } : {}),
+      ...(validMotion && JSON.stringify(animation) !== JSON.stringify(details.animation ?? null)
+        ? { animation }
+        : {}),
     };
   };
   const dirty = Object.keys(changes()).length > 0;
+  const hasFormDraft = Boolean(
+    details &&
+    ((details.editableText && text !== details.textContent) ||
+      Object.entries(styles).some(([key, value]) => value !== (details.computed[key] ?? '')) ||
+      motion !== (details.animation ? 'custom' : 'none') ||
+      duration !== String((details.animation?.duration ?? 1800) / 1000)),
+  );
+  dirtyRef.current = hasFormDraft;
+  const previewRevision = previews
+    .filter((edit) => edit.nodeId === details?.nodeId && edit.frameId === details?.frameId)
+    .map((edit) => edit.editId)
+    .join('|');
+  useEffect(() => {
+    if (!details || busy || hasFormDraft) return;
+    const signature = `${details.ref}:${previewRevision}`;
+    if (syncedPreview.current === signature) return;
+    syncedPreview.current = signature;
+    const current = request.current;
+    void window.workbench
+      .invoke<ElementDetails>('browser:element-details', { ref: details.ref })
+      .then((value) => {
+        if (value && current === request.current && !dirtyRef.current) load(value);
+      })
+      .catch(() => {});
+  }, [details?.ref, previewRevision, busy, hasFormDraft, onAction]);
   const sourceChanges = (): ElementEdit | undefined => {
     if (!details) return;
     const all = [
@@ -117,11 +198,12 @@ export function ElementInspector({
     for (const patch of all) {
       if (patch.text !== undefined) combined.text = patch.text;
       if (patch.styles) combined.styles = { ...combined.styles, ...patch.styles };
+      if (patch.animation !== undefined) combined.animation = patch.animation;
     }
     return Object.keys(combined).length ? combined : undefined;
   };
   const apply = async () => {
-    if (!details || !dirty || busy) return;
+    if (!details || !dirty || busy || !validMotion) return;
     const ref = details.ref;
     const patch = changes();
     const current = request.current;
@@ -131,7 +213,11 @@ export function ElementInspector({
     setBusy(false);
     if (result) {
       load(result.element);
-      setStatus('已应用到当前页面');
+      setStatus(
+        result.element.animationState === 'reduced-motion'
+          ? '样式已应用；系统减少动态效果，动效未播放。'
+          : '已应用到当前页面',
+      );
     }
   };
   const undo = async () => {
@@ -263,6 +349,7 @@ export function ElementInspector({
               [
                 ['text', '内容'],
                 ['styles', '样式'],
+                ['motion', '动效'],
                 ['details', '定位'],
               ] as const
             ).map(([id, label]) => (
@@ -306,7 +393,14 @@ export function ElementInspector({
             ) : section === 'styles' ? (
               <div className="style-fields">
                 {fields.map(([name, label]) => (
-                  <label key={name}>
+                  <label
+                    key={name}
+                    className={
+                      ['background-image', 'box-shadow', 'transform'].includes(name)
+                        ? 'wide'
+                        : undefined
+                    }
+                  >
                     <span>{label}</span>
                     <input
                       aria-label={label}
@@ -316,9 +410,50 @@ export function ElementInspector({
                       }
                       disabled={busy}
                       spellCheck={false}
+                      maxLength={500}
                     />
                   </label>
                 ))}
+              </div>
+            ) : section === 'motion' ? (
+              <div className="motion-fields">
+                <label>
+                  <span>动效</span>
+                  <select
+                    aria-label="元素动效"
+                    value={motion}
+                    disabled={busy}
+                    onChange={(event) => setMotion(event.target.value as MotionChoice)}
+                  >
+                    <option value="none">无</option>
+                    {details.animation && <option value="custom">当前自定义动效</option>}
+                    <option value="breathe">呼吸</option>
+                    <option value="bounce">弹跳</option>
+                    <option value="breathe-bounce">呼吸弹跳</option>
+                  </select>
+                </label>
+                <label>
+                  <span>周期（秒）</span>
+                  <input
+                    aria-label="动效周期"
+                    type="number"
+                    min="0.1"
+                    max="60"
+                    step="0.1"
+                    value={duration}
+                    disabled={busy || motion === 'none'}
+                    onChange={(event) => setDuration(event.target.value)}
+                  />
+                </label>
+                <p className="inspector-note" role="status">
+                  {!validMotion
+                    ? '周期应为 0.1–60 秒。'
+                    : details.animationState === 'reduced-motion'
+                      ? '系统已减少动态效果，动效配置保留但不播放。'
+                      : details.animation
+                        ? `已配置 ${details.animation.duration / 1000} 秒的动效。选择“无”并应用可停止本次预览动效。`
+                        : '选择动效后应用预览，可随时撤销。'}
+                </p>
               </div>
             ) : (
               <dl className="element-locator">
@@ -369,7 +504,7 @@ export function ElementInspector({
             </button>
             <button
               className="secondary-button"
-              disabled={busy}
+              disabled={busy || !validMotion}
               onClick={() => onSourceRequest(details, sourceChanges())}
             >
               修改源码
@@ -377,7 +512,7 @@ export function ElementInspector({
             </button>
             <button
               className="primary-button"
-              disabled={!dirty || busy}
+              disabled={!dirty || busy || !validMotion}
               onClick={() => void apply()}
             >
               {busy ? <Loader2 size={13} className="spin" /> : <Check size={13} />}应用预览

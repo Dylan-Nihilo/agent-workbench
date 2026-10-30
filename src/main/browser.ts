@@ -13,6 +13,7 @@ import type {
   ElementQueryResult,
   ElementEdit,
   ElementEditResult,
+  ElementAnimation,
   BrowserInput,
   BrowserState,
   BrowserTool,
@@ -20,6 +21,13 @@ import type {
   RecordedStep,
   Recording,
   ToolResult,
+} from '../shared/types';
+import {
+  ELEMENT_STYLE_PROPERTIES,
+  ELEMENT_ANIMATION_PROPERTIES,
+  ELEMENT_BACKGROUND_FUNCTIONS,
+  ELEMENT_PREVIEW_LIMITS,
+  ELEMENT_UNSAFE_CSS_PATTERN,
 } from '../shared/types';
 import { CdpConnection } from './browser-cdp';
 import { browserPageSource } from './browser-page';
@@ -30,6 +38,137 @@ const WORLD = 'workbench-browser-observer';
 const PREVIEW_MAX_EDGE = 2048;
 const PREVIEW_INTERVAL = 1000 / 24;
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const editableStyles = new Set<string>(ELEMENT_STYLE_PROPERTIES);
+const animatedStyles = new Set<string>(ELEMENT_ANIMATION_PROPERTIES);
+const backgroundFunctions = new Set<string>(ELEMENT_BACKGROUND_FUNCTIONS);
+const unsafeCss = new RegExp(ELEMENT_UNSAFE_CSS_PATTERN, 'i');
+
+function validateStyles(
+  value: unknown,
+  properties: ReadonlySet<string>,
+  allowEmpty: boolean,
+): asserts value is Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new Error('样式修改格式无效');
+  const entries = Object.entries(value);
+  if (entries.length > ELEMENT_PREVIEW_LIMITS.styleCount || (!allowEmpty && !entries.length))
+    throw new Error('样式属性数量无效');
+  for (const [name, item] of entries) {
+    if (
+      !properties.has(name) ||
+      typeof item !== 'string' ||
+      item.length > ELEMENT_PREVIEW_LIMITS.styleValueLength ||
+      (!allowEmpty && !item.trim()) ||
+      unsafeCss.test(item)
+    )
+      throw new Error(`不支持的 CSS 属性或值：${name}`);
+    if (['background', 'background-image'].includes(name)) {
+      const functions = [...item.matchAll(/([a-z][a-z0-9-]*)\s*\(/gi)].map((match) =>
+        match[1].toLowerCase(),
+      );
+      if (functions.some((fn) => !backgroundFunctions.has(fn)))
+        throw new Error('背景仅支持安全渐变、颜色和布局函数');
+    }
+  }
+}
+
+function validEasing(value: unknown): boolean {
+  if (
+    typeof value !== 'string' ||
+    value.length > ELEMENT_PREVIEW_LIMITS.easingLength ||
+    unsafeCss.test(value)
+  )
+    return false;
+  const easing = value.trim().toLowerCase();
+  if (
+    ['linear', 'ease', 'ease-in', 'ease-out', 'ease-in-out', 'step-start', 'step-end'].includes(
+      easing,
+    )
+  )
+    return true;
+  const curve = /^cubic-bezier\((.*)\)$/.exec(easing);
+  if (curve) {
+    const parts = curve[1].split(',').map((part) => part.trim());
+    if (
+      parts.length !== 4 ||
+      parts.some((part) => !/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(part))
+    )
+      return false;
+    const numbers = parts.map(Number);
+    return (
+      numbers.every(Number.isFinite) &&
+      numbers[0] >= 0 &&
+      numbers[0] <= 1 &&
+      numbers[2] >= 0 &&
+      numbers[2] <= 1
+    );
+  }
+  const steps =
+    /^steps\(\s*(\d+)\s*(?:,\s*(start|end|jump-start|jump-end|jump-none|jump-both)\s*)?\)$/.exec(
+      easing,
+    );
+  return (
+    !!steps &&
+    Number(steps[1]) >= (steps[2] === 'jump-none' ? 2 : 1) &&
+    Number(steps[1]) <= ELEMENT_PREVIEW_LIMITS.stepsMax
+  );
+}
+
+function validateAnimation(value: unknown): asserts value is ElementAnimation {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    Object.keys(value).some(
+      (key) => !['keyframes', 'duration', 'iterations', 'easing', 'direction'].includes(key),
+    )
+  )
+    throw new Error('动画配置格式无效');
+  const animation = value as ElementAnimation;
+  if (
+    !Array.isArray(animation.keyframes) ||
+    animation.keyframes.length < ELEMENT_PREVIEW_LIMITS.keyframesMin ||
+    animation.keyframes.length > ELEMENT_PREVIEW_LIMITS.keyframesMax
+  )
+    throw new Error('动画需要 2–12 个关键帧');
+  if (
+    !Number.isFinite(animation.duration) ||
+    animation.duration < ELEMENT_PREVIEW_LIMITS.durationMin ||
+    animation.duration > ELEMENT_PREVIEW_LIMITS.durationMax
+  )
+    throw new Error('动画时长必须为 100–60000 毫秒');
+  if (
+    animation.iterations !== undefined &&
+    animation.iterations !== 'infinite' &&
+    (!Number.isFinite(animation.iterations) ||
+      animation.iterations < 1 ||
+      animation.iterations > ELEMENT_PREVIEW_LIMITS.iterationsMax)
+  )
+    throw new Error('动画次数必须为 1–100 或 infinite');
+  if (animation.easing !== undefined && !validEasing(animation.easing))
+    throw new Error('动画 easing 无效');
+  if (
+    animation.direction !== undefined &&
+    !['normal', 'reverse', 'alternate', 'alternate-reverse'].includes(animation.direction)
+  )
+    throw new Error('动画方向无效');
+  let previous = 0;
+  for (const frame of animation.keyframes) {
+    if (
+      !frame ||
+      typeof frame !== 'object' ||
+      Array.isArray(frame) ||
+      Object.keys(frame).some((key) => !['offset', 'styles'].includes(key))
+    )
+      throw new Error('动画关键帧格式无效');
+    if (frame.offset !== undefined) {
+      if (!Number.isFinite(frame.offset) || frame.offset < previous || frame.offset > 1)
+        throw new Error('动画 offset 必须在 0–1 之间且非递减');
+      previous = frame.offset;
+    }
+    validateStyles(frame.styles, animatedStyles, false);
+  }
+}
 
 export function normalizeBrowserUrl(input: string): string {
   if (typeof input !== 'string' || !input.trim() || input.length > 4096)
@@ -75,6 +214,23 @@ function recordedEditValue(value: string): string {
       truncated ||= entries.length > 30;
     }
     if (typeof input.editId === 'string') output.editId = redactBrowserText(input.editId, 1500);
+    if (input.animation === null) output.animation = null;
+    else if (input.animation !== undefined) {
+      validateAnimation(input.animation);
+      const animation = input.animation as ElementAnimation;
+      output.animation = {
+        ...animation,
+        keyframes: animation.keyframes.map((frame) => ({
+          ...frame,
+          styles: Object.fromEntries(
+            Object.entries(frame.styles).map(([key, item]) => [
+              key,
+              redactBrowserText(item, ELEMENT_PREVIEW_LIMITS.styleValueLength),
+            ]),
+          ),
+        })),
+      };
+    }
     if (truncated) output.truncated = true;
     return JSON.stringify(output);
   } catch {
@@ -861,6 +1017,9 @@ export class BrowserRuntime {
     this.frameAckTimer = undefined;
     if (previous) {
       await previous.page.call('Page.stopScreencast').catch(() => {});
+      await previous.page
+        .call('Emulation.setFocusEmulationEnabled', { enabled: false })
+        .catch(() => {});
       await this.clearOutline(previous);
       previous.activation++;
       this.clearTabRefs(previous);
@@ -879,6 +1038,8 @@ export class BrowserRuntime {
       mobile: false,
     });
     await tab.page.call('Page.bringToFront');
+    // Headless neo can leave a restored native tab hidden; the embedded active page must keep rendering.
+    await tab.page.call('Emulation.setFocusEmulationEnabled', { enabled: true });
     await this.startScreencast(tab);
     await this.refreshTab(tab);
     if (record)
@@ -1588,7 +1749,7 @@ export class BrowserRuntime {
       !changes ||
       typeof changes !== 'object' ||
       Array.isArray(changes) ||
-      Object.keys(changes).some((key) => !['text', 'styles'].includes(key))
+      Object.keys(changes).some((key) => !['text', 'styles', 'animation'].includes(key))
     )
       throw new Error('元素修改格式无效');
     if (
@@ -1596,18 +1757,14 @@ export class BrowserRuntime {
       (typeof changes.text !== 'string' || changes.text.length > 20_000)
     )
       throw new Error('文字内容过长或无效');
+    if (changes.styles !== undefined) validateStyles(changes.styles, editableStyles, true);
+    if (changes.animation !== undefined && changes.animation !== null)
+      validateAnimation(changes.animation);
     if (
-      changes.styles !== undefined &&
-      (typeof changes.styles !== 'object' ||
-        !changes.styles ||
-        Array.isArray(changes.styles) ||
-        Object.keys(changes.styles).length > 30 ||
-        Object.entries(changes.styles).some(
-          ([key, value]) => key.length > 100 || typeof value !== 'string' || value.length > 500,
-        ))
+      changes.text === undefined &&
+      !Object.keys(changes.styles || {}).length &&
+      changes.animation === undefined
     )
-      throw new Error('样式修改格式无效');
-    if (changes.text === undefined && !Object.keys(changes.styles || {}).length)
       throw new Error('没有提供修改内容');
   }
   private registerEdit(tab: TabSession, frame: FrameContext, localId: string): string {
@@ -1837,16 +1994,92 @@ export class BrowserRuntime {
         limit: { type: 'integer', minimum: 1, maximum: 100 },
         frameId: { type: 'string' },
       }),
-      tool('inspect', '读取精确元素属性、计算样式、祖先与所在frame，不改变页面。', { ref }, [
-        'ref',
-      ]),
+      tool(
+        'inspect',
+        '读取精确元素属性、计算样式（含渐变、阴影、变换）、工具预览动画配置与实际播放状态、祖先和frame，不改变页面。',
+        { ref },
+        ['ref'],
+      ),
       tool(
         'edit',
-        '临时修改精确元素的文字或行内样式；这是当前页面预览，不是源码修改。',
+        '临时修改精确DOM文字、渐变背景、阴影、变换，或用animation结构创建可撤销WAAPI动效。styles支持列出的CSS属性；禁用URL、var/attr、代码、转义、!important和原始animation/transition属性。animation:null只取消Workbench自身动画；尊重减少动态效果设置。这是页面预览，不代表源码已修改。',
         {
           ref,
-          text: { type: 'string' },
-          styles: { type: 'object', additionalProperties: { type: 'string' } },
+          text: { type: 'string', maxLength: 20_000 },
+          styles: {
+            type: 'object',
+            maxProperties: ELEMENT_PREVIEW_LIMITS.styleCount,
+            propertyNames: { enum: [...ELEMENT_STYLE_PROPERTIES] },
+            additionalProperties: {
+              type: 'string',
+              maxLength: ELEMENT_PREVIEW_LIMITS.styleValueLength,
+            },
+            description:
+              '支持linear/radial/conic-gradient及安全颜色、box-shadow/text-shadow、transform/filter。空值删除该行内属性。',
+          },
+          animation: {
+            anyOf: [
+              { type: 'null' },
+              {
+                type: 'object',
+                additionalProperties: false,
+                required: ['keyframes', 'duration'],
+                properties: {
+                  keyframes: {
+                    type: 'array',
+                    minItems: ELEMENT_PREVIEW_LIMITS.keyframesMin,
+                    maxItems: ELEMENT_PREVIEW_LIMITS.keyframesMax,
+                    items: {
+                      type: 'object',
+                      additionalProperties: false,
+                      required: ['styles'],
+                      properties: {
+                        offset: {
+                          type: 'number',
+                          minimum: 0,
+                          maximum: 1,
+                          description: '已指定的offset必须非递减。',
+                        },
+                        styles: {
+                          type: 'object',
+                          minProperties: 1,
+                          maxProperties: ELEMENT_PREVIEW_LIMITS.styleCount,
+                          propertyNames: { enum: [...ELEMENT_ANIMATION_PROPERTIES] },
+                          additionalProperties: {
+                            type: 'string',
+                            minLength: 1,
+                            maxLength: ELEMENT_PREVIEW_LIMITS.styleValueLength,
+                          },
+                        },
+                      },
+                    },
+                  },
+                  duration: {
+                    type: 'number',
+                    minimum: ELEMENT_PREVIEW_LIMITS.durationMin,
+                    maximum: ELEMENT_PREVIEW_LIMITS.durationMax,
+                    description: '一轮时长，单位毫秒。',
+                  },
+                  iterations: {
+                    anyOf: [
+                      { type: 'number', minimum: 1, maximum: ELEMENT_PREVIEW_LIMITS.iterationsMax },
+                      { type: 'string', enum: ['infinite'] },
+                    ],
+                  },
+                  easing: {
+                    type: 'string',
+                    maxLength: ELEMENT_PREVIEW_LIMITS.easingLength,
+                    description:
+                      'linear/ease/ease-in/ease-out/ease-in-out/step-start/step-end，或合法cubic-bezier()/steps()。',
+                  },
+                  direction: {
+                    type: 'string',
+                    enum: ['normal', 'reverse', 'alternate', 'alternate-reverse'],
+                  },
+                },
+              },
+            ],
+          },
         },
         ['ref'],
       ),
@@ -1968,6 +2201,9 @@ export class BrowserRuntime {
                 ...(input.text !== undefined ? { text: input.text as string } : {}),
                 ...(input.styles !== undefined
                   ? { styles: input.styles as Record<string, string> }
+                  : {}),
+                ...(input.animation !== undefined
+                  ? { animation: input.animation as ElementAnimation | null }
                   : {}),
               },
               'agent',

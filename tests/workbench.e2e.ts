@@ -3,7 +3,12 @@ import { _electron as electron, expect } from '@playwright/test';
 import { createServer } from 'node:http';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { AppSnapshot, ElementQueryResult, ToolResult } from '../src/shared/types';
+import type {
+  AppSnapshot,
+  ElementDetails,
+  ElementQueryResult,
+  ToolResult,
+} from '../src/shared/types';
 
 const root = process.cwd();
 await mkdir(path.join(root, '.runtime'), { recursive: true });
@@ -22,15 +27,17 @@ const log=${JSON.stringify(log)};
 if(process.argv.includes('--version')){console.log('codex-cli workbench-fixture');process.exit(0)}
 if(process.argv[2]==='login'){console.error('Logged in using test fixture');process.exit(0)}
 const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+let turns=0;
 readline.createInterface({input:process.stdin}).on('line',line=>{
 const r=JSON.parse(line);fs.appendFileSync(log,line+'\\n');
 if(r.method==='initialize')return send({id:r.id,result:{userAgent:'fixture'}});
 if(r.method==='thread/start'||r.method==='thread/resume')return send({id:r.id,result:{thread:{id:'ui-thread'}}});
 if(r.method==='turn/start'){
-send({id:r.id,result:{turn:{id:'ui-turn',status:'inProgress'}}});
-send({method:'turn/started',params:{threadId:'ui-thread',turn:{id:'ui-turn'}}});
-send({method:'item/agentMessage/delta',params:{threadId:'ui-thread',turnId:'ui-turn',itemId:'reply',delta:'元素上下文已收到。'}});
-send({method:'turn/completed',params:{threadId:'ui-thread',turnId:'ui-turn',turn:{id:'ui-turn',status:'completed'}}});
+const turnId='ui-turn-'+(++turns);
+send({id:r.id,result:{turn:{id:turnId,status:'inProgress'}}});
+send({method:'turn/started',params:{threadId:'ui-thread',turn:{id:turnId}}});
+send({method:'item/agentMessage/delta',params:{threadId:'ui-thread',turnId:turnId,itemId:'reply',delta:'元素上下文已收到。'}});
+send({method:'turn/completed',params:{threadId:'ui-thread',turnId:turnId,turn:{id:turnId,status:'completed'}}});
 }});
 `,
 );
@@ -46,7 +53,7 @@ const server = createServer((request, response) => {
     response.end('<!doctype html><title>弹出页面</title><h1>第三个页面</h1>');
   else
     response.end(
-      '<!doctype html><html lang="zh-CN"><title>页面 A</title><style>body{font:16px system-ui;margin:32px;color:#202634}h1{font-size:24px;color:rgb(32,38,52)}.duplicate{padding:8px}input{padding:8px}</style><h1 data-testid="headline">需要修改的标题</h1><div class="duplicate">相同文字</div><div class="duplicate">相同文字</div><label>任务<input id="task" /></label><button id="add">添加</button></html>',
+      '<!doctype html><html lang="zh-CN"><title>页面 A</title><style>body{font:16px system-ui;margin:32px;color:#202634}h1{font-size:24px;color:rgb(32,38,52)}.duplicate{padding:8px}input{padding:8px}#add{background:linear-gradient(135deg,#3c5ee8,#123c9f);color:white}</style><h1 data-testid="headline">需要修改的标题</h1><div class="duplicate">相同文字</div><div class="duplicate">相同文字</div><label>任务<input id="task" /></label><button id="add">添加</button></html>',
     );
 });
 await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -233,6 +240,61 @@ try {
     'Cross-element undo consumes the successful patch even when selection changes before IPC resolves',
   );
 
+  await page.getByRole('textbox', { name: '查找页面元素' }).fill('#add');
+  await page.getByRole('button', { name: '查找', exact: true }).click();
+  await page.locator('.element-results > button').filter({ hasText: '添加' }).click();
+  await page.getByRole('tab', { name: '样式', exact: true }).click();
+  const redGradient = 'linear-gradient(135deg, #d9363e 0%, #c41e3a 55%, #9f1239 100%)';
+  await page.getByRole('textbox', { name: '背景 / 渐变', exact: true }).fill(redGradient);
+  await page
+    .getByRole('textbox', { name: '阴影', exact: true })
+    .fill('0 4px 12px rgba(159, 18, 57, 0.24)');
+  await page.getByRole('tab', { name: '动效', exact: true }).click();
+  await page.getByRole('combobox', { name: '元素动效' }).selectOption('breathe-bounce');
+  await page.getByRole('spinbutton', { name: '动效周期' }).fill('1.6');
+  await page.getByRole('button', { name: '应用预览', exact: true }).click();
+  const inspectSelected = () =>
+    page.evaluate(async () => {
+      const state = await window.workbench.invoke<AppSnapshot>('app:snapshot');
+      return window.workbench.invoke<ElementDetails>('browser:element-details', {
+        ref: state.browser.selectedElement!.ref,
+      });
+    });
+  await expect.poll(async () => (await inspectSelected()).animationState).toBe('running');
+  assert.match((await inspectSelected()).computed['background-image'], /217, 54, 62/);
+  assert.equal((await snapshot()).browser.previewEdits?.at(-1)?.changes.animation?.duration, 1600);
+  await viewportReady();
+  await expect(page.locator('.frame-loading')).toHaveCount(0);
+  await page.screenshot({ path: path.join(root, 'test-results/motion-inspector.png') });
+  await page.getByRole('button', { name: '修改源码', exact: true }).click();
+  await page.getByRole('button', { name: '发送任务', exact: true }).click();
+  await expect
+    .poll(async () => (await snapshot()).conversations[0]?.messages.at(-1)?.status)
+    .toBe('done');
+  const secondInput = (await readFile(log, 'utf8'))
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line))
+    .filter((request) => request.method === 'turn/start')
+    .at(-1).params.input[0].text;
+  const carriedPreview = JSON.parse(
+    secondInput.match(/页面预览修改（仅当前DOM，不代表源码已保存）：([^\n]+)/)![1],
+  );
+  assert.equal(carriedPreview.animation.duration, 1600);
+  assert.equal(carriedPreview.styles['background-image'], redGradient);
+  await page.getByRole('combobox', { name: '元素动效' }).selectOption('none');
+  await page.getByRole('button', { name: '应用预览', exact: true }).click();
+  await expect.poll(async () => (await inspectSelected()).animation ?? null).toBeNull();
+  await page.getByRole('button', { name: '撤销页面修改', exact: true }).click();
+  await expect.poll(async () => (await inspectSelected()).animationState).toBe('running');
+  await page.getByRole('button', { name: '撤销页面修改', exact: true }).click();
+  await expect.poll(async () => (await snapshot()).browser.previewEdits?.length).toBe(0);
+  assert.match((await inspectSelected()).computed['background-image'], /60, 94, 232/);
+  assert.equal((await inspectSelected()).animation ?? null, null);
+  checks.push(
+    'Gradient, shadow and breathing-bounce preview cross IPC, retain source context, stop and undo correctly',
+  );
+
   await page.getByRole('button', { name: '结束录制', exact: true }).click();
   const recording = (await snapshot()).recordings[0];
   assert.ok(recording.steps.some((step) => step.kind === 'edit'));
@@ -280,6 +342,23 @@ try {
   console.log(JSON.stringify({ passed: true, checks }));
 } catch (error) {
   const page = (await application.windows())[0];
+  const frameGeometry = await page
+    ?.evaluate(async () => {
+      const state = await window.workbench.invoke<AppSnapshot>('app:snapshot');
+      const rect = document.querySelector('.browser-surface')!.getBoundingClientRect();
+      const img = document.querySelector<HTMLImageElement>('.browser-frame')!;
+      return {
+        surface: { width: rect.width, height: rect.height },
+        frame: { width: state.browserFrame?.width, height: state.browserFrame?.height },
+        naturalImage: { width: img.naturalWidth, height: img.naturalHeight },
+        loading: !!document.querySelector('.frame-loading'),
+      };
+    })
+    .catch(() => undefined);
+  await writeFile(
+    path.join(root, 'test-results/workbench-frame-failure.json'),
+    JSON.stringify({ frameGeometry }, null, 2),
+  );
   await page
     ?.screenshot({ path: path.join(root, 'test-results/workbench-failure.png') })
     .catch(() => {});

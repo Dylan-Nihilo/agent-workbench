@@ -17,6 +17,7 @@ import type {
   BrowserInput,
   ChatMessage,
   Conversation,
+  ElementAnimation,
   ElementEdit,
   ElementQuery,
   FeishuMessage,
@@ -479,6 +480,10 @@ async function invoke(action: string, payload: unknown) {
         changes.styles = Object.fromEntries(
           Object.entries(styles).map(([key, value]) => [string(key, 80), string(value, 500)]),
         );
+      }
+      if (data.animation !== undefined) {
+        changes.animation =
+          data.animation === null ? null : (record(data.animation) as unknown as ElementAnimation);
       }
       return browser.editElement(string(data.ref, 1500), changes);
     }

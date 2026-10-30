@@ -12,6 +12,7 @@ async function fixture(
     threadStartDelayMs?: number;
     waitForLogin?: boolean;
     loginMessage?: string;
+    toolAggregatedOutput?: string;
   } = {},
 ) {
   const directory = await mkdtemp(path.join(tmpdir(), 'workbench-agent-test-'));
@@ -86,6 +87,11 @@ readline.createInterface({input:process.stdin}).on('line', line => {
       if(mode==='question-foreign-resolved') event('serverRequest/resolved',{threadId:'another-thread',requestId:110});
       return;
     }
+    if(mode==='tool-failure') {
+      const args={ref:'fixture-button',styles:{'background-image':'linear-gradient(90deg, black, white)'}};
+      event('item/started',{threadId:'thread-1',turnId:current,item:{id:'tool-1',type:'dynamicToolCall',tool:'workbench_browser_edit',arguments:args,status:'inProgress'}});
+      return send({id:101,method:'item/tool/call',params:{threadId:'thread-1',turnId:current,callId:'tool-1',tool:'workbench_browser_edit',arguments:args}});
+    }
     if(mode==='tool'||mode==='unknown'||mode==='pending-tool'||mode==='foreign-tool') {
       pendingTool=mode==='pending-tool';
       return send({id:101,method:'item/tool/call',params:{threadId:'thread-1',turnId:mode==='foreign-tool'?'previous-turn':current,callId:'tool-1',tool:mode==='unknown'?'read_secret':'browser_snapshot',arguments:{}}});
@@ -99,6 +105,13 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   if(request.id===100 && 'result' in request) { event('serverRequest/resolved',{threadId:'thread-1',requestId:100}); event('item/agentMessage/delta',{threadId:'thread-1',turnId:current,itemId:'approval-result',delta:request.result.decision}); return finish(); }
   if(request.id===110 && ('result' in request || 'error' in request)) { event('serverRequest/resolved',{threadId:'thread-1',requestId:110}); event('item/agentMessage/delta',{threadId:'thread-1',turnId:current,itemId:'input-result',delta:'Answers handled'}); return finish(); }
   if(request.id===120 && 'result' in request) return finish();
+  if(request.id===101 && 'result' in request && mode==='tool-failure') {
+    const item={id:'tool-1',type:'dynamicToolCall',tool:'workbench_browser_edit',status:'failed',success:request.result.success};
+    if(typeof options.toolAggregatedOutput==='string') item.aggregatedOutput=options.toolAggregatedOutput;
+    event('item/completed',{threadId:'thread-1',turnId:current,item});
+    event('item/agentMessage/delta',{threadId:'thread-1',turnId:current,itemId:'failure-explanation',delta:'未修改页面：'+request.result.contentItems[0].text});
+    return finish();
+  }
   if(request.id===101 && 'result' in request && !pendingTool) { event('item/agentMessage/delta',{threadId:'thread-1',turnId:current,itemId:'tool-result',delta:request.result.success?'tool succeeded':'tool rejected'}); return finish(); }
 });
 `;
@@ -228,6 +241,77 @@ test('browser tool bridge returns text and screenshot in the actual app-server s
   );
   assert.equal(reply.result.contentItems[1].imageUrl, 'data:image/png;base64,iVBORw0KGgo=');
   assert.ok(events.some((event) => event.type === 'tool' && event.call.status === 'done'));
+});
+
+test('dynamic tool completion preserves detailed rejection output while the explanation can complete', async (t) => {
+  const detail = 'Unsupported CSS property or value: background-image';
+  for (const [name, aggregatedOutput] of [
+    ['missing aggregate', undefined],
+    ['empty aggregate', ''],
+    ['nonempty aggregate takes precedence', 'Final tool diagnostic: background-image was rejected'],
+  ] as const) {
+    await t.test(name, async (t) => {
+      const f = await fixture({ toolAggregatedOutput: aggregatedOutput });
+      const events: AgentEvent[] = [];
+      const agent = session(
+        f,
+        events,
+        async (name, args) => {
+          assert.equal(name, 'workbench_browser_edit');
+          assert.deepEqual(args, {
+            ref: 'fixture-button',
+            styles: { 'background-image': 'linear-gradient(90deg, black, white)' },
+          });
+          return { isError: true, text: detail };
+        },
+        undefined,
+        {
+          tools: [
+            {
+              name: 'workbench_browser_edit',
+              description: 'Edit the fixture element',
+              inputSchema: { type: 'object', properties: {} },
+            },
+          ],
+        },
+      );
+      t.after(() => {
+        agent.close();
+        return f.cleanup();
+      });
+      await agent.send('tool-failure');
+      const reply = (await f.requests()).find((request) => request.id === 101 && request.result);
+      assert.equal(reply.result.success, false);
+      assert.equal(
+        reply.result.contentItems[0].text,
+        detail,
+        'The CLI receives the original rejection',
+      );
+      const updates = events
+        .filter((event) => event.type === 'tool')
+        .filter((event) => event.call.id === 'tool-1');
+      assert.equal(
+        updates.at(-2)?.call.output,
+        detail,
+        'The host callback initially emits the specific error',
+      );
+      const stored = updates.at(-1)!.call;
+      assert.equal(stored.status, 'error');
+      assert.equal(
+        stored.output,
+        aggregatedOutput || detail,
+        'The final upsert must not replace the diagnostic with a generic failure',
+      );
+      const complete = events.find((event) => event.type === 'complete');
+      assert.ok(complete?.type === 'complete');
+      assert.equal(complete.text, `未修改页面：${detail}`);
+      assert.equal(
+        events.some((event) => event.type === 'error'),
+        false,
+        'A completed failure explanation is not a fatal turn error',
+      );
+    });
+  }
 });
 
 test('unknown dynamic tools are refused without calling the host', async (t) => {
