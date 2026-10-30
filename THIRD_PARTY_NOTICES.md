@@ -29,6 +29,12 @@ BrowserOS neo 和 Electron 均包含 Chromium 及其他第三方组件，各组�
 
 Lucide 的许可证包含 Lucide Icons and Contributors 的 ISC 声明，以及所列 Feather 衍生图标的 Cole Bemis MIT 声明；分发图标时应一并保留，不能只保留表中的简写。
 
+## CLI 品牌图标
+
+Codex、Claude Code、Gemini CLI、OpenCode 使用 [Lobe Icons](https://github.com/lobehub/lobe-icons) 的专属单色 SVG，来自 `@lobehub/icons-static-svg@1.101.0`，固定发布提交 `aea0ecb0fe1439467219197c52ffaeb579dfe33f`。四份 SVG 保持上游图形不变，随应用内置，不在运行时请求 CDN。
+
+上游为 MIT，Copyright (c) 2023 LobeHub。完整许可随源码及应用保存在 `resources/licenses/lobe-icons-LICENSE.txt`；文件来源见 `src/renderer/assets/agents/README.md`。品牌标识用于识别对应 CLI，不表示本项目与相应权利人存在关联或背书。
+
 ## 构建与测试依赖
 
 | 组件 | 核查版本 | 上游许可 |

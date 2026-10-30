@@ -574,7 +574,7 @@ export class CodexSession {
         }
       });
       await this.request('initialize', {
-        clientInfo: { name: 'agent_workbench', title: 'Agent Workbench', version: '0.2.0' },
+        clientInfo: { name: 'agent_workbench', title: 'Agent Workbench', version: '0.2.1' },
         capabilities: { experimentalApi: true },
       });
       checkCurrent();

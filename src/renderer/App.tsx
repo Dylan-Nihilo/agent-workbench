@@ -28,6 +28,7 @@ import {
   X,
 } from 'lucide-react';
 import { BrowserPane } from './BrowserPane';
+import { AgentIcon } from './AgentIcon';
 import { RequestPanel } from './RequestPanel';
 import type {
   AgentInfo,
@@ -631,6 +632,7 @@ export default function App() {
               className="connection-button local-agent-status"
               onClick={() => setSettingsTab('agent')}
             >
+              <AgentIcon agent={settings.agent} size={15} />
               <span
                 className={`status-dot ${currentAgent?.available && currentAgent.authentication === 'ready' ? 'online' : ''}`}
               />
@@ -860,7 +862,7 @@ export default function App() {
                       aria-expanded={agentMenu}
                       onClick={() => setAgentMenu((value) => !value)}
                     >
-                      <Terminal size={14} />
+                      <AgentIcon agent={settings.agent} size={16} />
                       <span>{currentAgent?.name || 'Codex'}</span>
                       <span className={`status-dot ${currentAgent?.available ? 'online' : ''}`} />
                       <ChevronDown size={12} />
@@ -873,15 +875,18 @@ export default function App() {
                             disabled={!agent.available || !agent.supported || busy}
                             onClick={() => void selectAgent(agent.id)}
                           >
-                            <div>
-                              <strong>{agent.name}</strong>
-                              <span>
-                                {agent.available
-                                  ? agent.supported
-                                    ? agent.version || '已安装'
-                                    : '已检测，暂未接入'
-                                  : '未检测到'}
-                              </span>
+                            <div className="agent-option">
+                              <AgentIcon agent={agent.id} size={21} />
+                              <div className="agent-option-copy">
+                                <strong>{agent.name}</strong>
+                                <span>
+                                  {agent.available
+                                    ? agent.supported
+                                      ? agent.version || '已安装'
+                                      : '已检测，暂未接入'
+                                    : '未检测到'}
+                                </span>
+                              </div>
                             </div>
                             {agent.id === settings.agent && <Check size={14} />}
                           </button>
@@ -1090,8 +1095,8 @@ export default function App() {
                 <div className="agent-settings-list">
                   {agents.map((agent) => (
                     <div className="agent-setting-row" key={agent.id}>
-                      <div className="integration-icon">
-                        <Terminal size={19} />
+                      <div className="integration-icon agent-brand-tile">
+                        <AgentIcon agent={agent.id} size={25} />
                       </div>
                       <div>
                         <strong>{agent.name}</strong>

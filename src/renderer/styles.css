@@ -652,6 +652,20 @@ kbd {
 .agent-picker-wrap {
   position: relative;
 }
+.agent-icon {
+  display: inline-block;
+  flex: 0 0 auto;
+  background: currentColor;
+  mask-position: center;
+  mask-repeat: no-repeat;
+  mask-size: contain;
+  mask-mode: alpha;
+  -webkit-mask-position: center;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-size: contain;
+  vertical-align: middle;
+  pointer-events: none;
+}
 .agent-picker {
   display: flex;
   align-items: center;
@@ -776,6 +790,24 @@ kbd {
 .agent-menu strong,
 .agent-menu span {
   display: block;
+}
+.agent-option {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
+}
+.agent-option-copy {
+  min-width: 0;
+}
+.agent-menu .agent-icon {
+  margin: 0;
+  color: var(--ink);
+}
+.integration-icon.agent-brand-tile {
+  background: var(--paper);
+  border-color: var(--line);
+  color: var(--ink);
 }
 .agent-menu strong {
   font-size: 12px;
