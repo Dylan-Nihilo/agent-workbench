@@ -6,7 +6,7 @@
 
 ![Workbench 工作区](docs/screenshots/workspace.png)
 
-这是可运行的演示项目，仓库保持 `private` / `UNLICENSED`。当前接通的是 **Codex**；Claude Code、OpenCode、Gemini CLI 仅检测安装情况，尚不能在本应用执行任务。
+本仓库公开可见，项目代码保持 `UNLICENSED`，尚未授予开源许可证。当前接通的是 **Codex**；Claude Code、OpenCode、Gemini CLI 仅检测安装情况，尚不能在本应用执行任务。
 
 ## 启动
 

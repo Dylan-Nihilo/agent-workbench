@@ -2,7 +2,7 @@
 
 核查日期：2026-10-29。版本来自本次安装的包及锁文件；正式构建以 `package-lock.json` 和实际随包内容为准。
 
-Agent Workbench（界面简称 Workbench，仓库名 `agent-workbench`）是 `private` / `UNLICENSED` 演示项目，尚未对本项目代码授予开源许可证。以下许可属于相应第三方组件，不构成对 Workbench 本身的 MIT 或其他许可授权。
+Agent Workbench（界面简称 Workbench，仓库名 `agent-workbench`）的仓库公开可见，项目代码保持 `UNLICENSED`，尚未授予开源许可证。以下许可属于相应第三方组件，不构成对 Workbench 本身的 MIT 或其他许可授权。
 
 ## 独立进程组件
 
