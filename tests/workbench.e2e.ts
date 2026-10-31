@@ -111,6 +111,59 @@ try {
   await expect
     .poll(async () => (await snapshot()).browser.title, { timeout: 30_000 })
     .toContain('今日清单');
+  const prompt = page.getByRole('textbox', { name: '发送给 Agent 的任务' });
+  await prompt.fill('中文输入验证');
+  await prompt.evaluate((node) => {
+    node.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, data: '验证' }));
+    node.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        bubbles: true,
+        key: 'Enter',
+        code: 'Enter',
+        isComposing: true,
+        keyCode: 229,
+      }),
+    );
+    node.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '验证' }));
+  });
+  await expect(prompt).toHaveValue('中文输入验证');
+  assert.equal(
+    (await snapshot()).conversations.length,
+    0,
+    'IME confirmation must not create a task',
+  );
+  await prompt.press('Shift+Enter');
+  await expect(prompt).toHaveValue('中文输入验证\n');
+  await page.getByRole('button', { name: '选择 Agent', exact: true }).click();
+  await expect(page.getByRole('menu', { name: '选择 Agent' })).toBeVisible();
+  await page.screenshot({
+    path: path.join(root, 'test-results/heroui-agent-menu.png'),
+    animations: 'disabled',
+  });
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('menu')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '选择 Agent', exact: true })).toBeFocused();
+  await page.getByRole('button', { name: '设置', exact: true }).click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await page.getByRole('tab', { name: '飞书', exact: true }).click();
+  await expect(page.getByRole('button', { name: '创建专用机器人' })).toBeVisible();
+  await page.getByRole('tab', { name: '本机 Agent', exact: true }).click();
+  await page.screenshot({
+    path: path.join(root, 'test-results/heroui-settings.png'),
+    animations: 'disabled',
+  });
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '设置', exact: true })).toBeFocused();
+  await expect(prompt).toHaveValue('中文输入验证\n');
+  await page.getByRole('button', { name: '收起侧栏', exact: true }).click();
+  await expect(page.locator('.athena-sidebar')).toHaveAttribute('aria-hidden', 'true');
+  await page.getByRole('button', { name: '展开侧栏', exact: true }).click();
+  await expect(page.locator('.athena-sidebar')).toHaveAttribute('aria-hidden', 'false');
+  await prompt.fill('');
+  checks.push(
+    'IME confirmation and Shift+Enter preserve the draft; keyboard-dismissed menus and settings restore focus; sidebar controls work',
+  );
   await page.screenshot({
     path: path.join(root, 'docs/screenshots/chat.png'),
     animations: 'disabled',
@@ -149,6 +202,7 @@ try {
   await page.getByRole('textbox', { name: '查找页面元素' }).fill('[data-testid="headline"]');
   await page.getByRole('button', { name: '查找', exact: true }).click();
   await page.locator('.element-results > button').filter({ hasText: '需要修改的标题' }).click();
+  await page.getByRole('tab', { name: '内容', exact: true }).click();
   const text = page.getByRole('textbox', { name: '元素文字', exact: true });
   await expect(text).toHaveValue('需要修改的标题');
   await text.fill('标题已精准修改');
@@ -215,7 +269,7 @@ try {
   await expect(page.getByRole('textbox', { name: '发送给 Agent 的任务' })).toHaveValue(
     /将选中元素.*源码/,
   );
-  await page.getByRole('button', { name: '发送任务', exact: true }).click();
+  await page.getByRole('textbox', { name: '发送给 Agent 的任务' }).press('Enter');
   await expect
     .poll(async () => (await snapshot()).conversations[0]?.messages.at(-1)?.status)
     .toBe('done');
@@ -231,6 +285,7 @@ try {
   checks.push(
     'Source-edit handoff carries precise tab, element locator and accumulated preview changes to the local CLI',
   );
+  await page.getByRole('tab', { name: '元素', exact: true }).click();
 
   await page.getByRole('button', { name: '撤销页面修改', exact: true }).click();
   await expect(page.getByRole('textbox', { name: '字号', exact: true })).toHaveValue('24px');
@@ -298,6 +353,7 @@ try {
   );
   assert.equal(carriedPreview.animation.duration, 1600);
   assert.equal(carriedPreview.styles['background-image'], redGradient);
+  await page.getByRole('tab', { name: '元素', exact: true }).click();
   await page.getByRole('combobox', { name: '元素动效' }).selectOption('none');
   await page.getByRole('button', { name: '应用预览', exact: true }).click();
   await expect.poll(async () => (await inspectSelected()).animation ?? null).toBeNull();
@@ -317,7 +373,7 @@ try {
   assert.ok(recording.steps.some((step) => step.kind === 'undo'));
   assert.ok(new Set(recording.steps.map((step) => step.tabId).filter(Boolean)).size >= 2);
   checks.push('Recording preserves exact edit/undo targets and multiple tab identities');
-  await page.getByRole('button', { name: '网页', exact: true }).click();
+  await page.getByRole('radio', { name: '网页', exact: true }).click();
   await page.getByRole('button', { name: '关闭元素检查器' }).click();
   await page.screenshot({
     path: path.join(root, 'test-results/workbench-workspace.png'),

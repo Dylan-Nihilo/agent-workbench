@@ -1,3 +1,4 @@
+import { validateElementControls, controlProperties } from '../shared/element-controls';
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import { access, mkdir } from 'node:fs/promises';
 import { constants } from 'node:fs';
@@ -385,11 +386,15 @@ export class BrowserRuntime {
     width: number;
   };
   private frameAckTimer?: ReturnType<typeof setTimeout>;
+  private releaseFrame?: () => void;
+  private interactiveFrameUntil = 0;
   private starting?: Promise<void>;
   private disposed = false;
   private queue: Promise<unknown> = Promise.resolve();
   private leaseGeneration = 0;
   private agentAllowed = true;
+  private nativeAgentActive = false;
+  private pendingDialogs = new Map<string, BrowserChannel>();
   private suppressMouseUp = false;
   private pointerMove?: Promise<void>;
   private latestMove?: Extract<BrowserInput, { type: 'mouse' }>;
@@ -429,6 +434,8 @@ export class BrowserRuntime {
   }
   private update(patch: Partial<BrowserState> = {}): void {
     this.state = { ...this.state, ...patch };
+    if (this.state.elementControls?.ref !== this.state.selectedElement?.ref)
+      this.state.elementControls = undefined;
     this.options.onState(this.getState());
   }
   private updateTab(tab: TabSession, patch: Partial<BrowserTab>): void {
@@ -646,10 +653,17 @@ export class BrowserRuntime {
           height: p.metadata.deviceHeight || this.height,
           tabId: tab.info.id,
         });
-        this.frameAckTimer = setTimeout(() => {
+        const acknowledge = () => {
+          if (this.frameAckTimer) clearTimeout(this.frameAckTimer);
           this.frameAckTimer = undefined;
+          this.releaseFrame = undefined;
           void page.call('Page.screencastFrameAck', { sessionId: p.sessionId }).catch(() => {});
-        }, PREVIEW_INTERVAL);
+        };
+        this.releaseFrame = acknowledge;
+        this.frameAckTimer = setTimeout(
+          acknowledge,
+          Date.now() < this.interactiveFrameUntil ? 0 : PREVIEW_INTERVAL,
+        );
       });
       page.on('connection:closed', () => {
         if (!this.disposed && this.tabs.get(tab.info.id) === tab)
@@ -847,9 +861,15 @@ export class BrowserRuntime {
     );
     channel.on('Network.loadingFailed', (p) => this.log(tab, 'network.error', p.errorText));
     channel.on('Page.javascriptDialogOpening', () => {
+      if (this.nativeAgentActive && this.agentAllowed) {
+        this.pendingDialogs.set(tab.info.id, channel);
+        this.log(tab, 'dialog', '页面弹窗等待 Neo 任务处理');
+        return;
+      }
       this.log(tab, 'dialog', '页面弹窗已关闭；请在页面控件中完成交互。');
       void channel.call('Page.handleJavaScriptDialog', { accept: false }).catch(() => {});
     });
+    channel.on('Page.javascriptDialogClosed', () => this.pendingDialogs.delete(tab.info.id));
     channel.on('Fetch.requestPaused', (p) => {
       let allowed = p.request.url === 'about:blank';
       try {
@@ -1106,6 +1126,7 @@ export class BrowserRuntime {
     const previous = this.tabs.get(this.activeTabId);
     if (this.frameAckTimer) clearTimeout(this.frameAckTimer);
     this.frameAckTimer = undefined;
+    this.releaseFrame = undefined;
     if (previous) {
       await previous.page.call('Page.stopScreencast').catch(() => {});
       await previous.page
@@ -1145,6 +1166,51 @@ export class BrowserRuntime {
   }
   allowAgentControl(): void {
     this.agentAllowed = true;
+  }
+  async setNativeAgentActive(value: boolean): Promise<void> {
+    this.nativeAgentActive = value;
+    if (!value) {
+      const dialogs = [...this.pendingDialogs.values()];
+      this.pendingDialogs.clear();
+      await Promise.allSettled(
+        dialogs.map((channel) => channel.call('Page.handleJavaScriptDialog', { accept: false })),
+      );
+    }
+  }
+  getNativeConnection(): { endpoint: string; binaryPath: string } {
+    if (this.state.status !== 'ready' || !this.endpoint || !this.state.binaryPath)
+      throw new Error('浏览器尚未连接');
+    return { endpoint: this.endpoint, binaryPath: this.state.binaryPath };
+  }
+  /** Native Neo owns the action; Athena owns the visible tab and user-control lease. */
+  performNative<T>(
+    targetId: string | undefined,
+    operation: () => Promise<T>,
+    readonly = false,
+  ): Promise<T> {
+    const generation = this.leaseGeneration;
+    return this.serialize(async () => {
+      const guard = () => {
+        if (!readonly && (!this.agentAllowed || generation !== this.leaseGeneration))
+          throw new Error('用户已接管浏览器，操作已停止');
+      };
+      guard();
+      if (!targetId && !readonly) await this.setSource(this.activeTab(), 'agent');
+      if (targetId) {
+        if (this.attaching.has(targetId)) await this.attaching.get(targetId);
+        const tab = this.tabs.get(targetId);
+        if (!tab) throw new Error('Neo 目标页已关闭，请重新获取页面');
+        if (!readonly) await this.activateTab(tab, 'agent');
+        if (!readonly) await this.setSource(tab, 'agent');
+      }
+      guard();
+      const result = await operation();
+      guard();
+      return result;
+    });
+  }
+  followNativeTarget(targetId: string): Promise<void> {
+    return this.performNative(targetId, async () => {});
   }
   revokeAgentControl(): void {
     this.leaseGeneration++;
@@ -1350,6 +1416,7 @@ export class BrowserRuntime {
         });
       if (this.frameAckTimer) clearTimeout(this.frameAckTimer);
       this.frameAckTimer = undefined;
+      this.releaseFrame = undefined;
       await tab.page.call('Page.stopScreencast');
       try {
         const maxWidth = Math.max(w, Math.min(1920, Math.floor((8192 * w) / h)));
@@ -2002,7 +2069,65 @@ export class BrowserRuntime {
       frame,
       `globalThis.__workbenchPage.inspect(${JSON.stringify(scope.localRef)})`,
     );
-    return this.exposeDetails(tab, frame, detail);
+    const element = await this.exposeDetails(tab, frame, detail);
+    let objectId: string | undefined;
+    try {
+      const object = await frame.channel.call('Runtime.evaluate', {
+        expression: `globalThis.__workbenchPage.node(${JSON.stringify(scope.localRef)})`,
+        contextId: frame.contextId,
+      });
+      objectId = object.result?.objectId;
+      if (objectId) {
+        const [dom, ax] = await Promise.all([
+          frame.channel.call('DOM.describeNode', { objectId }),
+          frame.channel.call('Accessibility.getPartialAXTree', { objectId, fetchRelatives: false }),
+        ]);
+        element.backendNodeId = dom.node?.backendNodeId;
+        const node = ax.nodes?.find(
+          (node: any) => node.backendDOMNodeId === element.backendNodeId && !node.ignored,
+        );
+        const role = node?.role?.value;
+        if (role && !['generic', 'none', 'StaticText', 'InlineTextBox'].includes(role)) {
+          element.role = role;
+          element.semantics = {
+            kind: role,
+            source: 'accessibility',
+            evidence: ['Browser accessibility role: ' + role],
+          };
+        } else if (
+          element.semantics?.source !== 'html' &&
+          element.semantics?.source !== 'aria' &&
+          element.backendNodeId
+        ) {
+          // Event listeners are world-scoped; resolve the same DOM node in the page world.
+          const main = await frame.channel.call('DOM.resolveNode', {
+            backendNodeId: element.backendNodeId,
+          });
+          const mainId = main.object?.objectId;
+          if (mainId)
+            try {
+              const listeners = await frame.channel.call('DOMDebugger.getEventListeners', {
+                objectId: mainId,
+              });
+              if (listeners.listeners?.some((listener: any) => listener.type === 'click'))
+                element.semantics = {
+                  kind: 'button',
+                  source: 'inferred',
+                  evidence: [...(element.semantics?.evidence || []), 'click event listener'],
+                };
+            } finally {
+              await frame.channel
+                .call('Runtime.releaseObject', { objectId: mainId })
+                .catch(() => {});
+            }
+        }
+      }
+    } catch {
+      /* DOM evidence remains available on pages without AX support. */
+    } finally {
+      if (objectId) await frame.channel.call('Runtime.releaseObject', { objectId }).catch(() => {});
+    }
+    return element;
   }
   private async exposeDetails(
     tab: TabSession,
@@ -2044,7 +2169,7 @@ export class BrowserRuntime {
       `globalThis.__workbenchPage.outline(${JSON.stringify(scope.localRef)})`,
     );
     const detail = await this.detailsInternal(ref);
-    this.update({ selectedElement: detail, inspecting: false });
+    this.update({ selectedElement: detail, inspecting: false, elementControls: undefined });
     this.options.onSelected(detail);
     return detail;
   }
@@ -2054,6 +2179,59 @@ export class BrowserRuntime {
       return Promise.reject(new Error('元素引用已失效或属于其他标签页'));
     this.humanTakeover('edit');
     return this.serialize(() => this.editInternal(ref, changes, 'human'));
+  }
+  previewStyles(
+    ref: string,
+    styles: Record<string, string>,
+    editId?: string,
+  ): Promise<{ editId: string }> {
+    if (this.state.selectedElement?.ref !== ref)
+      return Promise.reject(new Error('选区已变化，请重新选取'));
+    this.humanTakeover('edit');
+    return this.serialize(async () => {
+      if (this.state.selectedElement?.ref !== ref) throw new Error('选区已变化，请重新选取');
+      this.validateEdit({ styles });
+      this.interactiveFrameUntil = Date.now() + 300;
+      this.releaseFrame?.();
+      const { tab, frame, scope } = await this.resolveRef(ref);
+      const previous = editId
+        ? tab.edits.find((edit) => edit.id === editId && edit.localRef === scope.localRef)
+        : undefined;
+      if (editId && !previous) throw new Error('预览手势已失效');
+      if (!previous) await this.setSource(tab, 'human', frame);
+      const result = await this.bridge(
+        tab,
+        frame,
+        `globalThis.__workbenchPage.previewStyles(${JSON.stringify({ ref: scope.localRef, styles, editId: previous?.localId })})`,
+      );
+      const id = this.registerEdit(tab, frame, result.editId);
+      const metadata = tab.edits.find((edit) => edit.id === id)!;
+      metadata.localRef = scope.localRef;
+      metadata.changes = { styles: { ...metadata.changes?.styles, ...styles } };
+      if (!previous) this.update();
+      return { editId: id };
+    });
+  }
+  commitStyles(ref: string, editId: string): Promise<ElementEditResult> {
+    return this.serialize(async () => {
+      if (this.state.selectedElement?.ref !== ref) throw new Error('选区已变化，请重新选取');
+      const { tab, frame, scope } = await this.resolveRef(ref);
+      const metadata = tab.edits.find(
+        (edit) => edit.id === editId && edit.localRef === scope.localRef,
+      );
+      if (!metadata) throw new Error('预览手势已失效');
+      const result = await this.bridge(
+        tab,
+        frame,
+        `globalThis.__workbenchPage.commitStyles(${JSON.stringify(metadata.localId)})`,
+      );
+      const element = await this.exposeDetails(tab, frame, result.element);
+      element.semantics = this.state.selectedElement?.semantics || element.semantics;
+      element.backendNodeId = this.state.selectedElement?.backendNodeId;
+      this.update({ selectedElement: element });
+      this.options.onSelected(element);
+      return { editId, element };
+    });
   }
   private validateEdit(changes: ElementEdit): void {
     if (
@@ -2306,6 +2484,33 @@ export class BrowserRuntime {
         frameId: { type: 'string' },
       }),
       tool(
+        'controls',
+        '为当前选中元素提供 A2UI v0.9.1 调整面板。只创建控件，不改变网页；用户拖动后本地预览。组件格式 {id,component,property,min?,max?,step?}，类型与属性必须匹配：' +
+          JSON.stringify(controlProperties),
+        {
+          ref,
+          components: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 24,
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string' },
+                component: { type: 'string', enum: ['Slider', 'ColorPicker', 'ChoicePicker'] },
+                property: { type: 'string', enum: Object.keys(controlProperties) },
+                min: { type: 'number' },
+                max: { type: 'number' },
+                step: { type: 'number' },
+              },
+              required: ['id', 'component', 'property'],
+              additionalProperties: false,
+            },
+          },
+        },
+        ['ref', 'components'],
+      ),
+      tool(
         'inspect',
         '读取精确元素属性、计算样式（含渐变、阴影、变换）、工具预览动画配置与实际播放状态、祖先和frame，不改变页面。',
         { ref },
@@ -2493,6 +2698,19 @@ export class BrowserRuntime {
           const { tabId: _, ...query } = input;
           return json(await this.queryInternal(tab, query as ElementQuery & { frameId?: string }));
         }
+        if (name === 'workbench_browser_controls') {
+          assertLease();
+          if (typeof input.ref !== 'string' || this.state.selectedElement?.ref !== input.ref)
+            throw new Error('面板只能用于当前选中元素');
+          await this.resolveRef(input.ref);
+          const controls = validateElementControls(input.components);
+          this.update({ elementControls: { ref: input.ref, revision: randomUUID(), controls } });
+          return json({
+            created: true,
+            protocol: 'A2UI v0.9.1',
+            message: '调整面板已显示，用户操作控件后才会修改页面。',
+          });
+        }
         if (name === 'workbench_browser_inspect') {
           if (typeof input.ref !== 'string') throw new Error('ref is required');
           return json(await this.detailsInternal(input.ref));
@@ -2633,6 +2851,7 @@ export class BrowserRuntime {
     this.recording = undefined;
     if (this.frameAckTimer) clearTimeout(this.frameAckTimer);
     this.frameAckTimer = undefined;
+    this.releaseFrame = undefined;
     for (const tab of this.tabs.values()) {
       for (const child of tab.children) child.close();
       tab.page.close();

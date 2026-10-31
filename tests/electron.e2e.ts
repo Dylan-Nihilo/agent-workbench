@@ -189,7 +189,7 @@ try {
   expect(recording.steps.some((step: any) => step.kind === 'click')).toBeTruthy();
   await page.screenshot({ path: path.join(root, 'docs/screenshots/recording.png') });
   checks.push('Human recording persisted with actual input and click');
-  await page.getByRole('button', { name: '网页', exact: true }).click();
+  await page.getByRole('radio', { name: '网页', exact: true }).click();
   await expect
     .poll(async () =>
       page.locator('.browser-frame').evaluate((node: HTMLImageElement) => node.naturalWidth),
@@ -234,7 +234,7 @@ try {
   }
   if (process.env.WORKBENCH_LIVE_ANALYSIS_TEST === '1') {
     const before = (await snapshot()).text;
-    await page.getByRole('button', { name: /操作记录/ }).click();
+    await page.getByRole('radio', { name: /操作记录/ }).click();
     await page.getByRole('button', { name: '让 Agent 理解这段操作' }).click();
     await expect
       .poll(

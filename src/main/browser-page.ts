@@ -150,6 +150,15 @@ export const browserPageSource = String.raw`(() => {
     if (/^h[1-6]$/.test(tag)) return 'heading';
     return ({button:'button',textarea:'textbox',img:'img',option:'option',ul:'list',ol:'list',li:'listitem',nav:'navigation',main:'main',aside:'complementary',table:'table',tr:'row',td:'cell',th:'columnheader'})[tag];
   }
+  function semantics(el) {
+    const explicit=el.getAttribute('role'), native=role(el);
+    if (native) return {kind:native,source:explicit?'aria':'html',evidence:[explicit?'role='+explicit:'tag='+el.localName]};
+    const evidence=[];
+    if (el.hasAttribute('onclick')) evidence.push('onclick attribute');
+    if (el.tabIndex>=0) evidence.push('keyboard focusable');
+    if (getComputedStyle(el).cursor==='pointer') evidence.push('pointer cursor');
+    return {kind:evidence.includes('onclick attribute') || evidence.length>=2 ? 'button':'element',source:evidence.length?'inferred':'unknown',evidence};
+  }
   function describe(el) {
     if (!(el instanceof Element) || overlays.has(el)) return null;
     flush();
@@ -381,7 +390,7 @@ export const browserPageSource = String.raw`(() => {
     for (let node=parent(el); node && ancestors.length<8; node=parent(node)) ancestors.push(describe(node));
     const textContent=sensitive(el) ? '[hidden]' : el.children.length || el.shadowRoot ? safeText(el,textLimit) : clean(leafText(el),textLimit);
     const animation=ownedAnimations.get(el);
-    return {...describe(el),textContent,...textEditState(el),attributes,computed,ancestors,animation:animation?.config ? clone(animation.config) : null,animationState:animation?.config ? reducedMotion.matches && !animation.player ? 'reduced-motion' : animation.player?.playState || 'idle' : 'idle'};
+    return {...describe(el),semantics:semantics(el),textContent,...textEditState(el),attributes,computed,ancestors,animation:animation?.config ? clone(animation.config) : null,animationState:animation?.config ? reducedMotion.matches && !animation.player ? 'reduced-motion' : animation.player?.playState || 'idle' : 'idle'};
   }
   document.addEventListener('click', event=> {
     if (!event.isTrusted && source!=='agent') return;
@@ -457,6 +466,34 @@ export const browserPageSource = String.raw`(() => {
       return describe(el);
     },
     atPoint(x,y) { const el=atPoint(x,y); return el ? describe(el) : null; },
+    node(ref) { return resolve(ref); },
+    previewStyles(request) {
+      const el=resolve(request.ref);
+      // Direct manipulation must show the real color, without a previous success wash.
+      if(feedbackElement===el) { clearTimeout(feedbackTimer);feedbackElement=null;feedbackPhase=null;refreshOverlays(); }
+      if (sensitive(el) || blockedEditTags.has(el.localName.toUpperCase())) throw new Error('Sensitive or executable elements cannot be edited');
+      const styles=validateStyles(request.styles);
+      let patch=request.editId ? patches.get(request.editId) : undefined;
+      if (request.editId && (!patch || !patch.transient || patch.el!==el || patch.ref!==request.ref || editOrder.at(-1)!==request.editId)) throw new Error('The preview gesture is stale');
+      if (patch && el.style.cssText!==patch.afterCssText) throw new Error('Page styles changed during this gesture; refusing to overwrite newer changes');
+      const editId=request.editId || docId+':edit:'+(++nextEditId);
+      if (!patch) {
+        patch={ref:request.ref,el,hasStyles:true,beforeCssText:el.style.cssText,transient:true,styles:{}};
+        patches.set(editId,patch);editOrder.push(editId);
+      }
+      for (const [name,value] of Object.entries(styles)) value==='' ? el.style.removeProperty(name) : el.style.setProperty(name,value);
+      Object.assign(patch.styles,styles);patch.afterCssText=el.style.cssText;
+      return {editId};
+    },
+    commitStyles(editId) {
+      const patch=patches.get(editId);
+      if (!patch || !patch.transient) throw new Error('No active preview gesture');
+      const el=resolve(patch.ref);
+      if (el!==patch.el || el.style.cssText!==patch.afterCssText) throw new Error('Page styles changed during this gesture; refusing to overwrite newer changes');
+      patch.transient=false;
+      send({kind:'edit',target:describe(el),editId,value:JSON.stringify({styles:patch.styles})});
+      return {editId,element:inspect(patch.ref)};
+    },
     edit(request) {
       if (!request || typeof request!=='object' || Array.isArray(request) || Object.keys(request).some(key=>!['ref','text','styles','animation'].includes(key))) throw new Error('Only text, supported styles and a preview animation can be edited');
       const el=resolve(request.ref);

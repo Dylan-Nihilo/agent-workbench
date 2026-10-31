@@ -1,3 +1,4 @@
+import type { ElementControlSurface } from './element-controls';
 export type AgentId = 'codex' | 'claude' | 'opencode' | 'gemini';
 export interface AgentInfo {
   id: AgentId;
@@ -17,6 +18,12 @@ export interface ElementRef {
   nodeId?: string;
   tag: string;
   role?: string;
+  semantics?: {
+    kind: string;
+    source: 'accessibility' | 'html' | 'aria' | 'inferred' | 'unknown';
+    evidence: string[];
+  };
+  backendNodeId?: number;
   name: string;
   selector?: string;
   text?: string;
@@ -213,7 +220,40 @@ export interface BrowserState {
   inspecting: boolean;
   selectedElement?: ElementRef;
   previewEdits?: ElementPreview[];
+  elementControls?: ElementControlSurface;
   error?: string;
+}
+export interface NativeNeoState {
+  status: 'stopped' | 'starting' | 'ready' | 'error';
+  version?: string;
+  error?: string;
+}
+export interface NeoSessionSummary {
+  sessionId: string;
+  name?: string;
+  label?: string;
+  site?: string;
+  taskSummary?: string;
+  startedAt: number;
+  durationMs?: number;
+  dispatchCount: number;
+  status: string;
+  errorCount?: number;
+}
+export interface NeoSessionDetail {
+  session: NeoSessionSummary;
+  dispatches: Array<{
+    dispatchId: number;
+    createdAt: number;
+    toolName: string;
+    pageId?: number;
+    targetId?: string;
+    title?: string;
+    argsJson?: string;
+    resultMeta?: string;
+    durationMs?: number;
+    parentDispatchId?: string;
+  }>;
 }
 export interface BrowserFrame {
   data: string;
@@ -259,6 +299,7 @@ export interface BrowserTool {
 export interface ToolResult {
   text: string;
   image?: string;
+  images?: string[];
   isError?: boolean;
 }
 export interface ToolCall {
@@ -273,6 +314,7 @@ export interface ApprovalRequest {
   title: string;
   detail: string;
   kind: 'command' | 'file' | 'other';
+  action?: 'browser-script' | 'browser-upload' | 'browser-help';
 }
 export interface UserInputRequest {
   id: string;
@@ -310,6 +352,7 @@ export interface ChatMessage {
   source?: 'desktop' | 'feishu';
   tools?: ToolCall[];
   context?: string;
+  neoSessionId?: string;
 }
 export interface Conversation {
   id: string;
@@ -351,6 +394,7 @@ export interface AppSnapshot {
   settings: Settings;
   agents: AgentInfo[];
   browser: BrowserState;
+  neo?: NativeNeoState;
   feishu: FeishuState;
   conversations: Conversation[];
   recordings: Recording[];
@@ -359,6 +403,7 @@ export interface AppSnapshot {
 }
 export type AppEvent =
   | { type: 'browser:state'; state: BrowserState }
+  | { type: 'neo:state'; state: NativeNeoState }
   | { type: 'browser:frame'; frame: BrowserFrame }
   | { type: 'browser:step'; step: RecordedStep }
   | { type: 'browser:selected'; element: ElementRef }

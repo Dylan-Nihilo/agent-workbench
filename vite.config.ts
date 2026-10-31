@@ -1,11 +1,13 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig(({ command }) => ({
   root: 'src/renderer',
   base: './',
   plugins: [
     react(),
+    tailwindcss(),
     {
       name: 'workbench-development-csp',
       transformIndexHtml(html) {

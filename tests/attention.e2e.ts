@@ -275,9 +275,13 @@ try {
     (await recorded()).some((entry) => entry.event === 'answered'),
     false,
   );
-  await panel.getByRole('radio', { name: /^只读检查/ }).check();
+  const readOnly = panel.getByRole('radio', { name: /^只读检查/ });
+  await readOnly.focus();
+  await page.keyboard.press('Space');
+  await expect(readOnly).toBeChecked();
   await expect(submit).toBeDisabled();
-  await panel.getByRole('radio', { name: '自行填写', exact: true }).check();
+  await panel.getByText('自行填写', { exact: true }).click();
+  await expect(panel.getByRole('radio', { name: '自行填写', exact: true })).toBeChecked();
   const freeform = panel.getByRole('textbox', { name: '补充说明如何提供？', exact: true });
   await expect(freeform).toBeVisible();
   await freeform.fill('   ');
@@ -373,6 +377,25 @@ try {
   );
   checks.push(
     'serverRequest/resolved removes the card and rejects subsequent approval without a CLI response',
+  );
+
+  const stopped = await sendPrompt('attention-input');
+  const nextDraft = page.getByRole('textbox', { name: '发送给 Agent 的任务' });
+  await nextDraft.fill('保留下一步草稿');
+  await page.locator('.composer').getByRole('button', { name: '停止任务', exact: true }).click();
+  await expect(panel).toHaveCount(0);
+  await expect
+    .poll(
+      async () =>
+        (await snapshot()).conversations
+          .find((item) => item.id === stopped.conversationId)
+          ?.messages.find((item) => item.id === stopped.messageId)?.status,
+    )
+    .not.toBe('streaming');
+  await expect(nextDraft).toHaveValue('保留下一步草稿');
+  assert((await recorded()).some((entry) => entry.message?.method === 'turn/interrupt'));
+  checks.push(
+    'Pro composer stop interrupts the active task, clears requests and keeps the next draft',
   );
 
   assert.deepEqual(errors, []);

@@ -1,16 +1,28 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, safeStorage, shell } from 'electron';
+import {
+  app,
+  BrowserWindow,
+  clipboard,
+  dialog,
+  ipcMain,
+  Menu,
+  net,
+  safeStorage,
+  shell,
+} from 'electron';
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { BrowserRuntime } from './browser';
-import { CodexSession, detectAgents } from './agents';
+import { CodexSession, detectAgents, browserToolsFingerprint } from './agents';
+import { NeoBrowserRuntime } from './neo-browser';
 import { FeishuConnector } from './feishu';
 import { TurnNotifications } from './notifications';
 import { Store } from './store';
 import type {
   AgentEvent,
   AgentInfo,
+  ApprovalRequest,
   AppEvent,
   AppSnapshot,
   BrowserFrame,
@@ -38,6 +50,7 @@ app.setAboutPanelOptions({ applicationName: 'Athena' });
 let window: BrowserWindow | undefined;
 let store: Store;
 let browser: BrowserRuntime;
+let neo: NeoBrowserRuntime;
 let feishu: FeishuConnector;
 let agents: AgentInfo[] = [];
 let active:
@@ -48,9 +61,12 @@ let active:
       readonly: boolean;
       notifications: TurnNotifications;
       requests: PendingAgentRequest[];
+      cancelled: boolean;
+      nativeApprovals: Map<string, (approved: boolean) => void>;
     }
   | undefined;
 let startingTurn = false;
+let preparingTurn: { cancelled: boolean } | undefined;
 let lastFrame: BrowserFrame | undefined;
 let demoServer: Server | undefined;
 let demoUrl = '';
@@ -189,11 +205,35 @@ async function runTurn(
   conversation.messages.push(user, assistant);
   conversation.updatedAt = Date.now();
   startingTurn = true;
-  await store.save().finally(() => {
+  const preparing = { cancelled: false };
+  preparingTurn = preparing;
+  await store.save().catch((error) => {
     startingTurn = false;
+    preparingTurn = undefined;
+    throw error;
   });
   emit({ type: 'conversation:updated', conversation });
+  try {
+    await neo.start();
+  } catch {
+    /* Local CLI tasks remain available; Neo reports its own connection state. */
+  }
+  if (preparing.cancelled) {
+    startingTurn = false;
+    preparingTurn = undefined;
+    assistant.status = 'error';
+    assistant.text = '任务已停止';
+    await store.save();
+    emit({ type: 'conversation:updated', conversation });
+    return assistant.text;
+  }
+  const tools = neo.getTools();
   let session = sessions.get(conversation.id);
+  if (session && session.toolsFingerprint !== browserToolsFingerprint(tools)) {
+    await session.close();
+    sessions.delete(conversation.id);
+    session = undefined;
+  }
   if (session?.isClosed) {
     sessions.delete(conversation.id);
     session = undefined;
@@ -205,14 +245,20 @@ async function runTurn(
       sessionId: conversation.agentSessionId,
       sessionToolsFingerprint: conversation.agentToolsFingerprint,
       historyForToolUpgrade: visibleHistory,
-      tools: browser.getTools(),
+      tools,
       inspectSelectedElement: (ref) => browser.getElementDetails(ref),
       callTool: async (name: string, args: unknown) => {
         if (!active || active.conversationId !== conversation.id)
           return { text: '任务已经停止，不能再执行浏览器操作。', isError: true };
-        if (active.readonly && !readOnlyBrowserTools.has(name))
+        if (
+          active.readonly &&
+          !readOnlyBrowserTools.has(name) &&
+          !neo.isReadOnly(name, args as Record<string, unknown>)
+        )
           return { text: '本轮只分析录制，不能执行页面操作。', isError: true };
-        return browser.callTool(name, args);
+        return name.startsWith('neo_')
+          ? neo.callTool(name, args as Record<string, unknown>)
+          : browser.callTool(name, args);
       },
       onEvent: (event: AgentEvent) => {
         if (!active || active.session !== session || active.conversationId !== conversation.id)
@@ -235,12 +281,31 @@ async function runTurn(
     readonly,
     notifications,
     requests: [],
+    cancelled: false,
+    nativeApprovals: new Map(),
   };
+  startingTurn = false;
+  preparingTurn = undefined;
   if (!readonly) browser.allowAgentControl();
   if (selectedElement && !readonly)
     void browser.setElementFeedback(selectedElement.ref, 'working').catch(() => {});
   try {
-    await session.send(text, context, selectedElement);
+    let nativeContext = '';
+    if (neo.getState().status === 'ready') {
+      const task = await neo.beginTask(assistant.id, readonly);
+      assistant.neoSessionId = task.sessionId;
+      nativeContext = task.context;
+      emit({ type: 'conversation:updated', conversation });
+    }
+    if (active?.cancelled) {
+      await neo.cancelTask();
+      throw new Error('任务已停止');
+    }
+    await session.send(
+      text,
+      [context, nativeContext].filter(Boolean).join('\n\n') || undefined,
+      selectedElement,
+    );
     if (assistant.status === 'streaming') assistant.status = 'done';
     if (session.sessionId) conversation.agentSessionId = session.sessionId;
     return notifications.includesSecretInput
@@ -258,6 +323,9 @@ async function runTurn(
       : error;
   } finally {
     browser.revokeAgentControl();
+    for (const resolve of active?.nativeApprovals.values() ?? []) resolve(false);
+    active?.nativeApprovals.clear();
+    await neo.finishTask(assistant.id).catch(() => {});
     if (selectedElement && !readonly)
       await browser.setElementFeedback(selectedElement.ref, null).catch(() => {});
     if (session.sessionId) conversation.agentSessionId = session.sessionId;
@@ -282,9 +350,44 @@ async function runTurn(
   }
 }
 async function stopTurn() {
+  if (preparingTurn) preparingTurn.cancelled = true;
   if (!active) return;
+  active.cancelled = true;
   browser.revokeAgentControl();
-  await active.session.interrupt();
+  for (const resolve of active.nativeApprovals.values()) resolve(false);
+  active.nativeApprovals.clear();
+  await neo.cancelTask();
+  await active?.session.interrupt();
+}
+function requestNativeApproval(request: Omit<ApprovalRequest, 'id' | 'kind'>): Promise<boolean> {
+  const turn = active;
+  if (!turn || turn.cancelled) return Promise.resolve(false);
+  const id = 'neo:' + randomUUID();
+  const assistant = getConversation(turn.conversationId).messages.find(
+    (message) => message.id === turn.messageId,
+  )!;
+  return new Promise((resolve) => {
+    turn.nativeApprovals.set(id, (approved) => {
+      turn.nativeApprovals.delete(id);
+      onAgentEvent(turn.conversationId, assistant, { type: 'request-resolved', id });
+      if (active === turn && !turn.cancelled)
+        onAgentEvent(turn.conversationId, assistant, {
+          type: 'status',
+          status: 'working',
+          label: '继续网页任务',
+        });
+      resolve(approved && active === turn && !turn.cancelled);
+    });
+    onAgentEvent(turn.conversationId, assistant, {
+      type: 'approval',
+      request: { ...request, id, kind: 'other' },
+    });
+    onAgentEvent(turn.conversationId, assistant, {
+      type: 'status',
+      status: 'waiting',
+      label: request.action === 'browser-help' ? '等待你处理网页' : '等待你的确认',
+    });
+  });
 }
 function startTurn(
   conversation: Conversation,
@@ -337,6 +440,7 @@ async function handleFeishuMessage(message: FeishuMessage) {
   }
 }
 async function createBrowserRuntime(binaryPath?: string) {
+  if (neo) await neo.stop();
   if (browser) await browser.dispose();
   browser = new BrowserRuntime({
     storageDir: path.join(app.getPath('userData'), 'browser'),
@@ -347,6 +451,8 @@ async function createBrowserRuntime(binaryPath?: string) {
         store.schedule();
       }
       emit({ type: 'browser:state', state });
+      if (state.status === 'ready' && neo?.getState().status === 'stopped')
+        void neo.start().catch(() => {});
     },
     onFrame: (frame) => {
       lastFrame = frame;
@@ -355,11 +461,24 @@ async function createBrowserRuntime(binaryPath?: string) {
     onStep: (step) => emit({ type: 'browser:step', step }),
     onSelected: (element) => emit({ type: 'browser:selected', element }),
     onHumanTakeover: () => {
-      if (active) {
+      if (preparingTurn) preparingTurn.cancelled = true;
+      if (active && !neo?.isHandingOver()) {
         void stopTurn().catch(() => {});
         notice('已交回页面控制权');
       }
     },
+  });
+  neo = new NeoBrowserRuntime(browser, {
+    directory: path.join(app.getPath('userData'), 'neo'),
+    download: (url, options) => net.fetch(url, options),
+    onState: (state) => emit({ type: 'neo:state', state }),
+    onDisconnect: () => {
+      if (active) {
+        void stopTurn().catch(() => {});
+        notice('Neo 控制连接已断开，网页任务已停止', 'error');
+      }
+    },
+    approve: requestNativeApproval,
   });
 }
 async function snapshot(): Promise<AppSnapshot> {
@@ -367,6 +486,7 @@ async function snapshot(): Promise<AppSnapshot> {
     settings: store.data.settings,
     agents,
     browser: browser.getState(),
+    neo: neo?.getState(),
     feishu: feishu.getState(),
     conversations: store.data.conversations,
     recordings: store.data.recordings,
@@ -406,7 +526,10 @@ async function invoke(action: string, payload: unknown) {
         typeof data.approved !== 'boolean'
       )
         throw new Error('审批已失效');
-      await active.session.resolveApproval(string(data.id, 512), data.approved);
+      const id = string(data.id, 512);
+      const native = active.nativeApprovals.get(id);
+      if (native) native(data.approved);
+      else await active.session.resolveApproval(id, data.approved);
       return true;
     }
     case 'agent:user-input': {
@@ -466,6 +589,15 @@ async function invoke(action: string, payload: unknown) {
       await store.save();
       return store.data.settings;
     }
+    case 'neo:connect':
+      if (active || startingTurn) throw new Error('请先停止当前任务');
+      await neo.stop();
+      await neo.start();
+      return neo.getState();
+    case 'neo:records':
+      return neo.server.records();
+    case 'neo:record':
+      return neo.server.detail(string(record(payload).id, 150));
     case 'browser:start':
       await browser.start();
       return browser.getState();
@@ -510,6 +642,24 @@ async function invoke(action: string, payload: unknown) {
           data.animation === null ? null : (record(data.animation) as unknown as ElementAnimation);
       }
       return browser.editElement(string(data.ref, 1500), changes);
+    }
+    case 'browser:preview-styles': {
+      const data = record(payload);
+      const styles = Object.fromEntries(
+        Object.entries(record(data.styles)).map(([key, value]) => [
+          string(key, 80),
+          string(value, 500),
+        ]),
+      );
+      return browser.previewStyles(
+        string(data.ref, 1500),
+        styles,
+        data.editId === undefined ? undefined : string(data.editId, 1500),
+      );
+    }
+    case 'browser:commit-styles': {
+      const data = record(payload);
+      return browser.commitStyles(string(data.ref, 1500), string(data.editId, 1500));
     }
     case 'browser:undo': {
       const data = payload === undefined ? {} : record(payload);
@@ -658,7 +808,7 @@ async function launch() {
       ]),
     );
   }
-  app.dock?.setIcon(path.join(app.getAppPath(), 'resources/icon.png'));
+  app.dock?.setIcon(path.join(app.getAppPath(), 'resources/athena-icon.png'));
   const demoHtml = await readFile(path.join(app.getAppPath(), 'resources/demo.html'));
   demoServer = createServer((request, response) => {
     if (request.url === '/' && request.method === 'GET') {
@@ -749,7 +899,7 @@ app.on('before-quit', (event) => {
   quitting = true;
   demoServer?.close();
   void Promise.allSettled([
-    browser?.dispose(),
+    neo?.stop().then(() => browser?.dispose()),
     feishu?.dispose(),
     store?.save(),
     ...[...sessions.values()].map((session) => session.close()),

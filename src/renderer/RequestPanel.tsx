@@ -1,3 +1,5 @@
+import { RadioGroup, Radio, Input, TextArea } from '@heroui/react';
+import { ActionButton } from './ui';
 import { useEffect, useRef, useState } from 'react';
 import { MessageSquare, ShieldCheck } from 'lucide-react';
 import type { PendingAgentRequest } from '../shared/types';
@@ -55,27 +57,27 @@ export function RequestPanel({
         {pending.kind === 'approval' ? <ShieldCheck size={17} /> : <MessageSquare size={17} />}
         <strong>{pending.kind === 'approval' ? pending.request.title : '需要你的回答'}</strong>
       </div>
-      <button className="request-task text-button" onClick={onShowTask}>
+      <ActionButton className="request-task text-button" onPress={onShowTask}>
         {taskTitle}
-      </button>
+      </ActionButton>
       {pending.kind === 'approval' ? (
         <>
           <pre>{pending.request.detail}</pre>
           <div className="button-row">
-            <button
+            <ActionButton
               className="secondary-button"
-              disabled={sending}
-              onClick={() => void respond('agent:approval', { approved: false })}
+              isDisabled={sending}
+              onPress={() => void respond('agent:approval', { approved: false })}
             >
-              拒绝
-            </button>
-            <button
+              {pending.request.action === 'browser-help' ? '停止处理' : '拒绝'}
+            </ActionButton>
+            <ActionButton
               className="primary-button"
-              disabled={sending}
-              onClick={() => void respond('agent:approval', { approved: true })}
+              isDisabled={sending}
+              onPress={() => void respond('agent:approval', { approved: true })}
             >
-              允许这次操作
-            </button>
+              {pending.request.action === 'browser-help' ? '已完成，继续' : '允许这次操作'}
+            </ActionButton>
           </div>
         </>
       ) : (
@@ -102,34 +104,41 @@ export function RequestPanel({
               return (
                 <fieldset key={question.id} disabled={sending}>
                   <legend>{question.question}</legend>
-                  {options.map((option, index) => (
-                    <label className="request-option" key={index}>
-                      <input
-                        type="radio"
-                        name={`${pending.request.id}:${question.id}`}
-                        checked={value.selected === index}
-                        onChange={() => update({ selected: index })}
-                      />
-                      <span>
-                        <strong>{option.label}</strong>
-                        {option.description && <small>{option.description}</small>}
-                      </span>
-                    </label>
-                  ))}
-                  {!!options.length && question.isOther && (
-                    <label className="request-option">
-                      <input
-                        type="radio"
-                        name={`${pending.request.id}:${question.id}`}
-                        checked={value.selected === options.length}
-                        onChange={() => update({ selected: options.length })}
-                      />
-                      <span>自行填写</span>
-                    </label>
+                  {!!options.length && (
+                    <RadioGroup
+                      aria-label={question.question}
+                      value={value.selected === undefined ? null : String(value.selected)}
+                      onChange={(selected) => update({ selected: Number(selected) })}
+                      isDisabled={sending}
+                    >
+                      {options.map((option, index) => (
+                        <Radio key={index} value={String(index)} className="request-option">
+                          <Radio.Content>
+                            <Radio.Control>
+                              <Radio.Indicator />
+                            </Radio.Control>
+                            <span>
+                              <strong>{option.label}</strong>
+                              {option.description && <small>{option.description}</small>}
+                            </span>
+                          </Radio.Content>
+                        </Radio>
+                      ))}
+                      {question.isOther && (
+                        <Radio value={String(options.length)} className="request-option">
+                          <Radio.Content>
+                            <Radio.Control>
+                              <Radio.Indicator />
+                            </Radio.Control>
+                            自行填写
+                          </Radio.Content>
+                        </Radio>
+                      )}
+                    </RadioGroup>
                   )}
                   {freeform &&
                     (question.isSecret ? (
-                      <input
+                      <Input
                         className="request-answer"
                         type="password"
                         aria-label={question.question}
@@ -140,7 +149,7 @@ export function RequestPanel({
                         onChange={(event) => update({ text: event.target.value })}
                       />
                     ) : (
-                      <textarea
+                      <TextArea
                         className="request-answer"
                         aria-label={question.question}
                         rows={2}
@@ -155,18 +164,23 @@ export function RequestPanel({
             })}
           </div>
           <div className="button-row">
-            <button type="button" className="secondary-button" disabled={sending} onClick={onStop}>
+            <ActionButton
+              type="button"
+              className="secondary-button"
+              isDisabled={sending}
+              onPress={onStop}
+            >
               停止任务
-            </button>
-            <button
+            </ActionButton>
+            <ActionButton
               type="submit"
               className="primary-button"
-              disabled={
+              isDisabled={
                 sending || pending.request.questions.some((question) => !answerFor(question))
               }
             >
               {sending ? '提交中…' : '提交回答'}
-            </button>
+            </ActionButton>
           </div>
         </form>
       )}

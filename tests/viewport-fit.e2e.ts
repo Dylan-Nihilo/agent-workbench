@@ -207,6 +207,7 @@ try {
   await expect
     .poll(async () => (await snapshot()).browser.selectedElement?.selector)
     .toBe('#right');
+  await page.getByRole('tab', { name: '内容', exact: true }).click();
   await expect(page.getByRole('textbox', { name: '元素文字', exact: true })).toHaveValue(
     '查看详情',
   );

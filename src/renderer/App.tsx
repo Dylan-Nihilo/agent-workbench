@@ -1,7 +1,10 @@
+import { ActionButton } from './ui';
+import { Button, Dropdown, Label, Description, Input, Modal, Tabs } from '@heroui/react';
+import { Sidebar, PromptInput, ChatMessage as ProChatMessage } from '@heroui-pro/react';
+import athenaLogo from './assets/brand/athena-profile.png';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Markdown from 'react-markdown';
 import {
-  ArrowUp,
   ArrowUpRight,
   Check,
   ChevronDown,
@@ -22,12 +25,12 @@ import {
   RefreshCw,
   Settings2,
   ShieldCheck,
-  Square,
   Terminal,
   Unplug,
   X,
 } from 'lucide-react';
 import { BrowserPane } from './BrowserPane';
+import { ElementInspector } from './ElementInspector';
 import { AgentIcon } from './AgentIcon';
 import { RequestPanel } from './RequestPanel';
 import type {
@@ -46,6 +49,7 @@ import type {
   RecordedStep,
   Recording,
   Settings,
+  NativeNeoState,
 } from '../shared/types';
 
 const emptyBrowser: BrowserState = {
@@ -100,8 +104,21 @@ function ToolActivity({ tools }: { tools: NonNullable<ChatMessage['tools']> }) {
       new_tab: '新建标签页',
       switch_tab: '切换标签页',
       close_tab: '关闭标签页',
+      act: '操作网页',
+      run: '处理网页步骤',
+      read: '读取网页',
+      grep: '查找内容',
+      diff: '查看页面变化',
+      wait: '等待页面',
+      upload: '上传文件',
+      download: '下载文件',
+      pdf: '保存页面',
+      request_human_help: '交给你处理',
+      await_human_help: '等待你的操作',
+      status: '检查浏览器连接',
     };
     return (
+      names[raw.replace(/^(?:workbench_browser_|neo_)/, '')] ||
       Object.entries(names).find(([key]) => raw.includes(key))?.[1] ||
       raw.replace(/^workbench_browser_/, '')
     );
@@ -127,60 +144,34 @@ function ToolActivity({ tools }: { tools: NonNullable<ChatMessage['tools']> }) {
     </div>
   );
 }
-function Modal({
+function SettingsModal({
   title,
   children,
   onClose,
+  isOpen,
 }: {
   title: string;
   children: React.ReactNode;
   onClose: () => void;
+  isOpen: boolean;
 }) {
-  const ref = useRef<HTMLDialogElement>(null);
-  const [phase, setPhase] = useState<'entering' | 'open' | 'closing'>('entering');
-  const closeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  useEffect(() => {
-    ref.current?.showModal();
-    if (ref.current) void ref.current.offsetWidth;
-    const frame = requestAnimationFrame(() => setPhase('open'));
-    return () => {
-      cancelAnimationFrame(frame);
-      clearTimeout(closeTimer.current);
-      ref.current?.close();
-    };
-  }, []);
-  const close = () => {
-    if (phase === 'closing') return;
-    setPhase('closing');
-    const duration = matchMedia('(prefers-reduced-motion: reduce)').matches
-      ? 0
-      : parseFloat(
-          getComputedStyle(document.documentElement).getPropertyValue('--modal-close-dur'),
-        ) || 150;
-    closeTimer.current = setTimeout(onClose, duration);
-  };
   return (
-    <dialog
-      className={`settings-dialog t-modal ${phase === 'open' ? 'is-open' : phase === 'closing' ? 'is-closing' : ''}`}
-      ref={ref}
-      onCancel={(event) => {
-        event.preventDefault();
-        close();
-      }}
-      onClick={(event) => {
-        if (event.target === ref.current) close();
+    <Modal.Backdrop
+      isOpen={isOpen}
+      onOpenChange={(open) => {
+        if (!open) onClose();
       }}
     >
-      <div className="dialog-content">
-        <div className="dialog-heading">
-          <h2>{title}</h2>
-          <button className="icon-button" aria-label="关闭设置" onClick={close}>
-            <X size={18} />
-          </button>
-        </div>
-        {children}
-      </div>
-    </dialog>
+      <Modal.Container>
+        <Modal.Dialog className="settings-dialog">
+          <Modal.CloseTrigger aria-label="关闭设置" />
+          <Modal.Header>
+            <Modal.Heading>{title}</Modal.Heading>
+          </Modal.Header>
+          <Modal.Body className="settings-content">{children}</Modal.Body>
+        </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
   );
 }
 
@@ -189,6 +180,8 @@ export default function App() {
   const [settings, setSettings] = useState<Settings>({ workspace: '', agent: 'codex' });
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [browser, setBrowser] = useState<BrowserState>(emptyBrowser);
+  const [neo, setNeo] = useState<NativeNeoState>({ status: 'stopped' });
+  const [nativeRecordId, setNativeRecordId] = useState<string>();
   const [feishu, setFeishu] = useState<FeishuState>(emptyFeishu);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversationId, setConversationId] = useState<string>();
@@ -199,6 +192,8 @@ export default function App() {
   const [selectedEdit, setSelectedEdit] = useState<ElementEdit>();
   const [sidebar, setSidebar] = useState(true);
   const [browserVisible, setBrowserVisible] = useState(false);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const editingElement = inspectorOpen && browserVisible;
   const [browserWidth, setBrowserWidth] = useState(620);
   const [panelWidth, setPanelWidth] = useState(1100);
   const [resizingBrowser, setResizingBrowser] = useState(false);
@@ -211,7 +206,7 @@ export default function App() {
   const [connecting, setConnecting] = useState(false);
   const [manualAppId, setManualAppId] = useState('');
   const [manualSecret, setManualSecret] = useState('');
-  const composer = useRef<HTMLTextAreaElement>(null);
+  const composer = useRef<HTMLDivElement>(null);
   const panels = useRef<HTMLDivElement>(null);
   const resizeStart = useRef<{ x: number; width: number } | undefined>(undefined);
   const revealBrowserOnTool = useRef(true);
@@ -261,10 +256,14 @@ export default function App() {
     }
     let disposed = false;
     let browserUpdated = false;
+    let neoUpdated = false;
     let feishuUpdated = false;
     let requestsUpdated = false;
     const handle = (event: AppEvent) => {
-      if (event.type === 'browser:frame') {
+      if (event.type === 'neo:state') {
+        neoUpdated = true;
+        setNeo(event.state);
+      } else if (event.type === 'browser:frame') {
         if (!event.frame.tabId || event.frame.tabId === activeBrowserTab.current)
           lastFrame.current = event.frame;
       } else if (event.type === 'browser:state') {
@@ -301,7 +300,8 @@ export default function App() {
           revealBrowserOnTool.current = true;
         if (
           agentEvent.type === 'tool' &&
-          agentEvent.call.name.startsWith('workbench_browser_') &&
+          (agentEvent.call.name.startsWith('workbench_browser_') ||
+            agentEvent.call.name.startsWith('neo_')) &&
           revealBrowserOnTool.current
         ) {
           setBrowserVisible(true);
@@ -390,6 +390,7 @@ export default function App() {
         if (disposed) return;
         lastFrame.current ??= snapshot.browserFrame;
         setSettings(snapshot.settings);
+        if (!neoUpdated) setNeo(snapshot.neo ?? { status: 'stopped' });
         setAgents(snapshot.agents);
         if (!browserUpdated) {
           activeBrowserTab.current = snapshot.browser.activeTabId;
@@ -412,12 +413,7 @@ export default function App() {
     if (stickToBottom.current)
       scroll.current?.scrollTo({ top: scroll.current.scrollHeight, behavior: 'instant' });
   }, [messages, currentBusy]);
-  useEffect(() => {
-    if (composer.current) {
-      composer.current.style.height = 'auto';
-      composer.current.style.height = `${Math.min(160, composer.current.scrollHeight)}px`;
-    }
-  }, [draft]);
+
   useEffect(() => {
     setSelected(undefined);
     setSelectedEdit(undefined);
@@ -432,6 +428,34 @@ export default function App() {
     return () => observer.disconnect();
   }, []);
 
+  useEffect(() => {
+    if (browser.selectedElement?.ref) {
+      setInspectorOpen(true);
+      setBrowserVisible(true);
+    }
+  }, [browser.selectedElement?.ref]);
+  useEffect(() => {
+    if (browser.elementControls?.revision) {
+      setInspectorOpen(true);
+      setBrowserVisible(true);
+    }
+  }, [browser.elementControls?.revision]);
+  useEffect(() => {
+    if (editingElement && browser.selectedElement) setSelected(browser.selectedElement);
+  }, [editingElement, browser.selectedElement?.ref]);
+  const requestSource = (element: ElementDetails, changes?: ElementEdit) => {
+    setSelected(element);
+    setSelectedEdit(changes);
+    setInspectorOpen(false);
+    setDraft(
+      (previous) =>
+        previous.trim() ||
+        (changes
+          ? '请将选中元素的页面预览改动应用到当前项目源码，并验证页面。'
+          : '请在当前项目源码中定位选中的元素，先说明对应组件和可修改的位置。'),
+    );
+    composer.current?.querySelector('textarea')?.focus();
+  };
   const newConversation = useCallback(async () => {
     const item = await action<Conversation>('conversation:new');
     if (item) {
@@ -439,8 +463,9 @@ export default function App() {
       setConversationId(item.id);
       setDraft('');
       setSelected(undefined);
+      setInspectorOpen(false);
       stickToBottom.current = true;
-      composer.current?.focus();
+      composer.current?.querySelector('textarea')?.focus();
     }
   }, [action, upsert]);
   useEffect(() => {
@@ -484,6 +509,7 @@ export default function App() {
   }, [newConversation, action, browserVisible, browser.activeTabId]);
   const send = async () => {
     if (!draft.trim() || busy) return;
+    setInspectorOpen(false);
     const context = selected
       ? `选中元素引用：${selected.ref}\n页面预览修改（仅当前DOM，不代表源码已保存）：${JSON.stringify(selectedEdit ?? null)}\n当前页面：${pageSource(browser.url)}\n页面效果调整直接使用元素编辑工具。仅当用户要求修改或保存到源码时，核实项目与页面的对应关系、定位真实组件并验证修改；不要把DOM预览当成源码修改。`
       : undefined;
@@ -539,48 +565,59 @@ export default function App() {
   const openLink = (url: string) => void action('shell:openExternal', { url });
 
   return (
-    <div
+    <Sidebar.Provider
+      open={sidebar}
+      onOpenChange={setSidebar}
+      collapsible="offcanvas"
+      toggleShortcut={false}
       className={`app-shell ${sidebar ? '' : 'sidebar-collapsed'} ${browserVisible ? '' : 'browser-collapsed'}`}
     >
-      <aside className="sidebar" aria-hidden={!sidebar} inert={!sidebar}>
+      <Sidebar
+        className="athena-sidebar"
+        aria-label="主导航"
+        aria-hidden={!sidebar}
+        inert={!sidebar}
+      >
         <div className="window-drag sidebar-top">
-          <button
+          <ActionButton
             className="icon-button"
             title="收起侧栏 · ⌘B"
             aria-label="收起侧栏"
-            onClick={() => setSidebar(false)}
+            onPress={() => setSidebar(false)}
           >
             <PanelLeftClose size={17} />
-          </button>
+          </ActionButton>
         </div>
-        <div className="brand">
-          <span className="brand-mark">
-            <Command size={18} strokeWidth={1.7} />
-          </span>
+        <Sidebar.Header className="brand">
+          <img className="brand-mark" src={athenaLogo} alt="" />
           <span>Athena</span>
-        </div>
-        <button className="new-conversation" onClick={() => void newConversation()}>
+        </Sidebar.Header>
+        <ActionButton
+          className="new-conversation"
+          variant="secondary"
+          onPress={() => void newConversation()}
+        >
           <Plus size={17} />
           <span>新对话</span>
           <kbd>⌘N</kbd>
-        </button>
-        <button
+        </ActionButton>
+        <ActionButton
           className="workspace-selector"
-          onClick={() => void workspace()}
+          onPress={() => void workspace()}
           title={settings.workspace}
         >
           <FolderOpen size={16} />
           <span>{basename(settings.workspace)}</span>
           <ChevronDown size={13} />
-        </button>
+        </ActionButton>
         <div className="sidebar-section-label">对话</div>
-        <nav className="conversation-list" aria-label="对话列表">
+        <Sidebar.Content className="conversation-list" aria-label="对话列表">
           {conversations.length ? (
             conversations.map((item) => (
-              <button
+              <ActionButton
                 key={item.id}
                 className={`conversation-link ${item.id === conversationId ? 'active' : ''}`}
-                onClick={() => {
+                onPress={() => {
                   setConversationId(item.id);
                   setSelected(undefined);
                   stickToBottom.current = true;
@@ -593,48 +630,48 @@ export default function App() {
                   <MessageSquare size={14} />
                 )}
                 <span>{item.title}</span>
-              </button>
+              </ActionButton>
             ))
           ) : (
             <p className="sidebar-empty">新的对话会保存在这里</p>
           )}
-        </nav>
-        <div className="sidebar-bottom">
-          <button className="sidebar-connection" onClick={() => setSettingsTab('feishu')}>
+        </Sidebar.Content>
+        <Sidebar.Footer className="sidebar-bottom">
+          <ActionButton className="sidebar-connection" onPress={() => setSettingsTab('feishu')}>
             <Link2 size={16} />
             <span>飞书</span>
             <span className={`connection-caption ${connected ? 'connected' : ''}`}>
               {connected ? '已连接' : feishu.status === 'connected' ? '待配对' : '连接'}
             </span>
-          </button>
-          <button className="sidebar-settings" onClick={() => setSettingsTab('agent')}>
+          </ActionButton>
+          <ActionButton className="sidebar-settings" onPress={() => setSettingsTab('agent')}>
             <Settings2 size={16} />
             <span>设置</span>
-          </button>
+          </ActionButton>
           <div className="local-note">
             <span className="status-dot online" />
             <span>本机工作区</span>
           </div>
-        </div>
-      </aside>
+        </Sidebar.Footer>
+      </Sidebar>
       <main className="work-area">
         <header className="topbar window-drag">
           <div className={`topbar-title ${sidebar ? '' : 'with-traffic-lights'}`}>
             {!sidebar && (
-              <button
+              <ActionButton
                 className="icon-button"
                 aria-label="展开侧栏"
-                onClick={() => setSidebar(true)}
+                onPress={() => setSidebar(true)}
               >
                 <PanelLeftOpen size={17} />
-              </button>
+              </ActionButton>
             )}
             <span>{conversation?.title || '新对话'}</span>
           </div>
           <div className="topbar-actions">
-            <button
+            <ActionButton
               className="connection-button local-agent-status"
-              onClick={() => setSettingsTab('agent')}
+              onPress={() => setSettingsTab('agent')}
             >
               <AgentIcon agent={settings.agent} size={15} />
               <span
@@ -652,20 +689,20 @@ export default function App() {
                     ? '启动异常'
                     : '未检测到'}
               </span>
-            </button>
+            </ActionButton>
             <span className="toolbar-divider" />
-            <button
+            <ActionButton
               className={`browser-toggle ${browserVisible ? 'is-on' : ''}`}
               aria-label={browserVisible ? '收起浏览器' : '展开浏览器'}
               title="浏览器"
-              onClick={() => {
+              onPress={() => {
                 setBrowserVisible((value) => !value);
-                if (browserVisible) composer.current?.focus();
+                if (browserVisible) composer.current?.querySelector('textarea')?.focus();
               }}
             >
               <PanelRightOpen size={18} />
               <span>浏览器</span>
-            </button>
+            </ActionButton>
           </div>
         </header>
         <div
@@ -673,8 +710,34 @@ export default function App() {
           className={`workspace-panels ${resizingBrowser ? 'is-resizing' : ''}`}
           style={{ '--browser-drawer-width': `${drawerWidth}px` } as React.CSSProperties}
         >
-          <section className="chat-panel" aria-label="AI 对话">
-            <div
+          <Tabs
+            variant="secondary"
+            selectedKey={editingElement ? 'element' : 'conversation'}
+            onSelectionChange={(key) => {
+              setInspectorOpen(key === 'element');
+              if (key === 'element') setBrowserVisible(true);
+            }}
+            className={`chat-panel ${editingElement ? 'is-editing' : ''}`}
+            aria-label="AI 工作区"
+          >
+            <Tabs.ListContainer className="workspace-view-tabs">
+              <Tabs.List aria-label="工作区视图">
+                <Tabs.Tab id="conversation">
+                  <MessageSquare size={14} />
+                  对话
+                  <Tabs.Indicator />
+                </Tabs.Tab>
+                <Tabs.Tab id="element" isDisabled={browser.status !== 'ready'}>
+                  <Settings2 size={14} />
+                  元素
+                  <Tabs.Indicator />
+                </Tabs.Tab>
+              </Tabs.List>
+            </Tabs.ListContainer>
+            <Tabs.Panel
+              id="conversation"
+              shouldForceMount
+              hidden={editingElement}
               className="chat-scroll"
               ref={scroll}
               onScroll={() => {
@@ -686,9 +749,7 @@ export default function App() {
             >
               {!messages.length ? (
                 <div className="welcome">
-                  <div className="welcome-symbol">
-                    <Command size={25} strokeWidth={1.2} />
-                  </div>
+                  <img className="welcome-symbol" src={athenaLogo} alt="Athena" />
                   <h1>今天想完成什么？</h1>
                   <p>
                     打开网页、选中元素，
@@ -696,20 +757,20 @@ export default function App() {
                     或录下你想复现的一段操作。
                   </p>
                   <div className="welcome-actions">
-                    <button
-                      onClick={() => {
+                    <ActionButton
+                      onPress={() => {
                         setDraft('检查当前页面的主要内容和可交互元素。');
                         setBrowserVisible(true);
-                        composer.current?.focus();
+                        composer.current?.querySelector('textarea')?.focus();
                       }}
                     >
                       <Globe2 size={16} />
                       <span>查看当前页面</span>
                       <ArrowUpRight size={14} />
-                    </button>
-                    <button
-                      disabled={browser.status !== 'ready'}
-                      onClick={() => {
+                    </ActionButton>
+                    <ActionButton
+                      isDisabled={browser.status !== 'ready'}
+                      onPress={() => {
                         setBrowserVisible(true);
                         void action('browser:inspect', { enabled: true });
                       }}
@@ -717,10 +778,10 @@ export default function App() {
                       <MousePointer2 size={16} />
                       <span>选取并修改元素</span>
                       <ArrowUpRight size={14} />
-                    </button>
-                    <button
-                      disabled={browser.status !== 'ready' || browser.recording}
-                      onClick={() => {
+                    </ActionButton>
+                    <ActionButton
+                      isDisabled={browser.status !== 'ready' || browser.recording}
+                      onPress={() => {
                         setBrowserVisible(true);
                         void action('recording:start');
                       }}
@@ -728,7 +789,7 @@ export default function App() {
                       <Circle size={15} />
                       <span>录制一段操作</span>
                       <ArrowUpRight size={14} />
-                    </button>
+                    </ActionButton>
                   </div>
                 </div>
               ) : (
@@ -740,7 +801,11 @@ export default function App() {
                     >
                       {message.role === 'user' ? (
                         <>
-                          <div className="user-message-text">{message.text}</div>
+                          <ProChatMessage.User>
+                            <ProChatMessage.Bubble className="user-message-text">
+                              {message.text}
+                            </ProChatMessage.Bubble>
+                          </ProChatMessage.User>
                           {message.source === 'feishu' && (
                             <div className="message-source">
                               <Link2 size={11} />
@@ -757,31 +822,33 @@ export default function App() {
                       ) : (
                         <>
                           <div className="assistant-label">
-                            <Command size={14} />
+                            <img src={athenaLogo} alt="" />
                             <span>Athena</span>
                           </div>
                           {!!message.tools?.length && <ToolActivity tools={message.tools} />}
                           {message.text && (
-                            <div className="markdown">
-                              <Markdown
-                                components={{
-                                  img: () => null,
-                                  a: ({ href, children }) => (
-                                    <a
-                                      href={href}
-                                      onClick={(event) => {
-                                        event.preventDefault();
-                                        if (href) openLink(href);
-                                      }}
-                                    >
-                                      {children}
-                                    </a>
-                                  ),
-                                }}
-                              >
-                                {message.text}
-                              </Markdown>
-                            </div>
+                            <ProChatMessage.Assistant>
+                              <ProChatMessage.Content className="markdown">
+                                <Markdown
+                                  components={{
+                                    img: () => null,
+                                    a: ({ href, children }) => (
+                                      <a
+                                        href={href}
+                                        onClick={(event) => {
+                                          event.preventDefault();
+                                          if (href) openLink(href);
+                                        }}
+                                      >
+                                        {children}
+                                      </a>
+                                    ),
+                                  }}
+                                >
+                                  {message.text}
+                                </Markdown>
+                              </ProChatMessage.Content>
+                            </ProChatMessage.Assistant>
                           )}
                           {message.status === 'streaming' && (
                             <div className="thinking-line">
@@ -792,19 +859,30 @@ export default function App() {
                           {message.status === 'error' && (
                             <span className="message-failure">这次任务未完成</span>
                           )}
-                          {message.status === 'done' && message.text && (
+                          {message.status !== 'streaming' && message.text && (
                             <div className="message-actions">
-                              <button
+                              <ActionButton
                                 className="icon-button"
                                 title="复制回答"
                                 aria-label="复制回答"
-                                onClick={() => {
+                                onPress={() => {
                                   void action('app:copy', { text: message.text });
                                   showToast('已复制回答');
                                 }}
                               >
                                 <Copy size={13} />
-                              </button>
+                              </ActionButton>
+                              {message.neoSessionId && (
+                                <ActionButton
+                                  className="text-button"
+                                  onPress={() => {
+                                    setNativeRecordId(message.neoSessionId);
+                                    setBrowserVisible(true);
+                                  }}
+                                >
+                                  查看网页执行过程
+                                </ActionButton>
+                              )}
                             </div>
                           )}
                         </>
@@ -813,7 +891,27 @@ export default function App() {
                   ))}
                 </div>
               )}
-            </div>
+            </Tabs.Panel>
+            <Tabs.Panel
+              id="element"
+              shouldForceMount
+              className="element-workspace"
+              hidden={!editingElement}
+            >
+              <ElementInspector
+                hidden={!editingElement}
+                selected={browser.selectedElement}
+                tabId={browser.activeTabId}
+                previews={browser.previewEdits ?? []}
+                controlSurface={browser.elementControls}
+                onAction={action}
+                onClose={() => {
+                  setInspectorOpen(false);
+                  composer.current?.querySelector('textarea')?.focus();
+                }}
+                onSourceRequest={requestSource}
+              />
+            </Tabs.Panel>
             <div className="composer-area">
               {pendingRequests[0] && (
                 <RequestPanel
@@ -828,122 +926,132 @@ export default function App() {
                   onShowTask={() => setConversationId(pendingRequests[0].conversationId)}
                 />
               )}
-              <div className={`composer ${busy ? 'is-busy' : ''}`}>
-                {selected && (
-                  <div className="selected-context">
-                    <MousePointer2 size={13} />
-                    <span>{selected.name || selected.tag}</span>
-                    <code>{selected.role || selected.tag}</code>
-                    <button aria-label="移除选中元素" onClick={() => setSelected(undefined)}>
-                      <X size={12} />
-                    </button>
-                  </div>
-                )}
-                <textarea
-                  ref={composer}
-                  aria-label="发送给 Agent 的任务"
-                  placeholder={
-                    selected ? '对这个元素有什么想法？' : '描述任务，或选中页面中的元素…'
-                  }
-                  value={draft}
-                  onChange={(event) => setDraft(event.target.value)}
-                  rows={2}
-                  onKeyDown={(event) => {
-                    if (
-                      event.key === 'Enter' &&
-                      !event.shiftKey &&
-                      !event.nativeEvent.isComposing
-                    ) {
-                      event.preventDefault();
-                      void send();
-                    }
-                  }}
-                />
-                <div className="composer-controls">
-                  <div className="agent-picker-wrap">
-                    <button
-                      className="agent-picker"
-                      aria-expanded={agentMenu}
-                      onClick={() => setAgentMenu((value) => !value)}
-                    >
-                      <AgentIcon agent={settings.agent} size={16} />
-                      <span>{currentAgent?.name || 'Codex'}</span>
-                      <span className={`status-dot ${currentAgent?.available ? 'online' : ''}`} />
-                      <ChevronDown size={12} />
-                    </button>
-                    {agentMenu && (
-                      <div className="agent-menu">
-                        {agents.map((agent) => (
-                          <button
-                            key={agent.id}
-                            disabled={!agent.available || !agent.supported || busy}
-                            onClick={() => void selectAgent(agent.id)}
-                          >
-                            <div className="agent-option">
-                              <AgentIcon agent={agent.id} size={21} />
-                              <div className="agent-option-copy">
-                                <strong>{agent.name}</strong>
-                                <span>
-                                  {agent.available
-                                    ? agent.supported
-                                      ? agent.version || '已安装'
-                                      : '已检测，暂未接入'
-                                    : '未检测到'}
-                                </span>
-                              </div>
-                            </div>
-                            {agent.id === settings.agent && <Check size={14} />}
-                          </button>
-                        ))}
-                        <button
-                          className="agent-menu-settings"
-                          onClick={() => {
-                            setAgentMenu(false);
-                            setSettingsTab('agent');
-                          }}
+              <PromptInput
+                ref={composer}
+                className={`composer ${busy ? 'is-busy' : ''}`}
+                value={draft}
+                onValueChange={setDraft}
+                status={busy ? 'streaming' : 'ready'}
+                lockInputOnRun={false}
+                maxHeight={160}
+                onSubmit={() => void send()}
+                onStop={() => void action('conversation:stop')}
+              >
+                <PromptInput.Shell>
+                  {selected && (
+                    <div className="selected-context">
+                      <MousePointer2 size={13} />
+                      <span title={selected.name || selected.tag}>
+                        {selected.name || selected.tag}
+                      </span>
+                      <code>{selected.role || selected.tag}</code>
+                      <ActionButton
+                        isIconOnly
+                        aria-label="移除选中元素"
+                        onPress={() => setSelected(undefined)}
+                      >
+                        <X size={12} />
+                      </ActionButton>
+                    </div>
+                  )}
+                  <PromptInput.Content>
+                    <PromptInput.TextArea
+                      aria-label="发送给 Agent 的任务"
+                      placeholder={
+                        selected ? '对这个元素有什么想法？' : '描述任务，或选中页面中的元素…'
+                      }
+                      onKeyDownCapture={(event) => {
+                        // beta.10 handles Enter before its consumer callback; composition must not submit.
+                        if (
+                          event.key === 'Enter' &&
+                          (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229)
+                        )
+                          event.stopPropagation();
+                      }}
+                    />
+                  </PromptInput.Content>
+                  <PromptInput.Toolbar className="composer-controls">
+                    <PromptInput.ToolbarStart>
+                      <Dropdown isOpen={agentMenu} onOpenChange={setAgentMenu}>
+                        <Button
+                          className="agent-picker"
+                          variant="ghost"
+                          size="sm"
+                          aria-label="选择 Agent"
                         >
-                          管理本机 Agent
-                          <ArrowUpRight size={13} />
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                  <div className="composer-right">
-                    <span className="composer-hint">
-                      {busy && !currentBusy ? '另一任务进行中' : '↵ 发送'}
-                    </span>
-                    {busy ? (
-                      <button
-                        className="send-button stop-button"
-                        aria-label="停止任务"
-                        title="停止任务"
-                        onClick={() => void action('conversation:stop')}
-                      >
-                        <Square size={12} fill="currentColor" />
-                      </button>
-                    ) : (
-                      <button
-                        className="send-button"
-                        aria-label="发送任务"
-                        disabled={
-                          !loaded ||
-                          !draft.trim() ||
-                          !currentAgent?.available ||
-                          currentAgent.authentication === 'missing'
+                          <AgentIcon agent={settings.agent} size={18} />
+                          <span>{currentAgent?.name || 'Codex'}</span>
+                          <span
+                            className={`status-dot ${currentAgent?.available ? 'online' : ''}`}
+                          />
+                          <ChevronDown size={12} />
+                        </Button>
+                        <Dropdown.Popover placement="top start" className="agent-menu">
+                          <Dropdown.Menu
+                            aria-label="本机 Agent"
+                            onAction={(key) => {
+                              if (key === 'manage') {
+                                setAgentMenu(false);
+                                setSettingsTab('agent');
+                              } else void selectAgent(key as Settings['agent']);
+                            }}
+                          >
+                            <Dropdown.Section>
+                              {agents.map((agent) => (
+                                <Dropdown.Item
+                                  key={agent.id}
+                                  id={agent.id}
+                                  textValue={agent.name}
+                                  isDisabled={!agent.available || !agent.supported || busy}
+                                >
+                                  <AgentIcon agent={agent.id} size={22} />
+                                  <div className="agent-option-copy">
+                                    <Label>{agent.name}</Label>
+                                    <Description>
+                                      {agent.available
+                                        ? agent.supported
+                                          ? agent.version || '已安装'
+                                          : '已检测，暂未接入'
+                                        : '未检测到'}
+                                    </Description>
+                                  </div>
+                                  {agent.id === settings.agent && (
+                                    <Check size={14} className="agent-selected" />
+                                  )}
+                                </Dropdown.Item>
+                              ))}
+                            </Dropdown.Section>
+                            <Dropdown.Item id="manage" textValue="管理本机 Agent">
+                              <Settings2 size={15} />
+                              <Label>管理本机 Agent</Label>
+                            </Dropdown.Item>
+                          </Dropdown.Menu>
+                        </Dropdown.Popover>
+                      </Dropdown>
+                    </PromptInput.ToolbarStart>
+                    <PromptInput.ToolbarEnd className="composer-right">
+                      <span className="composer-hint">
+                        {busy && !currentBusy ? '另一任务进行中' : '↵ 发送'}
+                      </span>
+                      <PromptInput.Send
+                        aria-label={busy ? '停止任务' : '发送任务'}
+                        isDisabled={
+                          !busy &&
+                          (!loaded ||
+                            !draft.trim() ||
+                            !currentAgent?.available ||
+                            currentAgent.authentication === 'missing')
                         }
-                        onClick={() => void send()}
-                      >
-                        <ArrowUp size={18} />
-                      </button>
-                    )}
-                  </div>
-                </div>
-              </div>
+                      />
+                    </PromptInput.ToolbarEnd>
+                  </PromptInput.Toolbar>
+                </PromptInput.Shell>
+              </PromptInput>
               <div className="composer-footer">
                 <FolderOpen size={11} />
-                <button onClick={() => void workspace()} title={settings.workspace}>
+                <ActionButton onPress={() => void workspace()} title={settings.workspace}>
                   {basename(settings.workspace)}
-                </button>
+                </ActionButton>
                 {browser.recording && (
                   <span className="composer-recording">
                     <span className="record-dot" />
@@ -952,7 +1060,7 @@ export default function App() {
                 )}
               </div>
             </div>
-          </section>
+          </Tabs>
           <aside
             className={`browser-drawer t-resize ${browserVisible ? 'is-open' : ''}`}
             aria-label="浏览器侧栏"
@@ -1009,6 +1117,8 @@ export default function App() {
             />
             <BrowserPane
               state={browser}
+              neo={neo}
+              nativeRecordId={nativeRecordId}
               recordings={recordings}
               liveSteps={liveSteps}
               initialFrame={lastFrame.current}
@@ -1018,20 +1128,10 @@ export default function App() {
               onAnalyze={(id) => void analyze(id)}
               onClose={() => {
                 setBrowserVisible(false);
-                composer.current?.focus();
+                composer.current?.querySelector('textarea')?.focus();
               }}
-              onSourceRequest={(element: ElementDetails, changes?: ElementEdit) => {
-                setSelected(element);
-                setSelectedEdit(changes);
-                setDraft(
-                  (previous) =>
-                    previous.trim() ||
-                    (changes
-                      ? '请将选中元素的页面预览改动应用到当前项目源码，并验证页面。'
-                      : '请在当前项目源码中定位选中的元素，先说明对应组件和可修改的位置。'),
-                );
-                composer.current?.focus();
-              }}
+              inspectorOpen={editingElement}
+              onToggleInspector={() => setInspectorOpen((value) => !value)}
             />
           </aside>
         </div>
@@ -1043,59 +1143,58 @@ export default function App() {
         >
           {toast.error ? <Circle size={14} /> : <Check size={14} />}
           <span>{toast.text}</span>
-          <button aria-label="关闭提示" onClick={() => setToast(undefined)}>
+          <ActionButton aria-label="关闭提示" onPress={() => setToast(undefined)}>
             <X size={13} />
-          </button>
+          </ActionButton>
         </div>
       )}
-      {settingsTab && (
-        <Modal title="设置与连接" onClose={() => setSettingsTab(null)}>
-          <div className="settings-tabs" role="tablist">
-            <button
-              role="tab"
-              aria-selected={settingsTab === 'agent'}
-              className={settingsTab === 'agent' ? 'active' : ''}
-              onClick={() => setSettingsTab('agent')}
-            >
-              <Terminal size={15} />
-              本机 Agent
-            </button>
-            <button
-              role="tab"
-              aria-selected={settingsTab === 'browser'}
-              className={settingsTab === 'browser' ? 'active' : ''}
-              onClick={() => setSettingsTab('browser')}
-            >
-              <Globe2 size={15} />
-              浏览器
-            </button>
-            <button
-              role="tab"
-              aria-selected={settingsTab === 'feishu'}
-              className={settingsTab === 'feishu' ? 'active' : ''}
-              onClick={() => setSettingsTab('feishu')}
-            >
-              <Link2 size={15} />
-              飞书
-            </button>
-          </div>
+      <SettingsModal
+        title="设置与连接"
+        isOpen={Boolean(settingsTab)}
+        onClose={() => setSettingsTab(null)}
+      >
+        <Tabs
+          variant="secondary"
+          selectedKey={settingsTab || 'agent'}
+          onSelectionChange={(key) => setSettingsTab(key as SettingsTab)}
+          className="settings-tab-layout"
+        >
+          <Tabs.ListContainer>
+            <Tabs.List aria-label="设置分类" className="settings-tabs">
+              <Tabs.Tab id="agent">
+                <Terminal size={15} />
+                本机 Agent
+                <Tabs.Indicator />
+              </Tabs.Tab>
+              <Tabs.Tab id="browser">
+                <Globe2 size={15} />
+                浏览器
+                <Tabs.Indicator />
+              </Tabs.Tab>
+              <Tabs.Tab id="feishu">
+                <Link2 size={15} />
+                飞书
+                <Tabs.Indicator />
+              </Tabs.Tab>
+            </Tabs.List>
+          </Tabs.ListContainer>
           <div className="settings-body">
             {settingsTab === 'agent' && (
-              <>
+              <Tabs.Panel id="agent">
                 <div className="settings-section-heading">
                   <div>
                     <h3>使用你已有的 Agent</h3>
                     <p>读取本机安装状态。浏览器任务目前使用 Codex。</p>
                   </div>
-                  <button
+                  <ActionButton
                     className="icon-button"
                     aria-label="刷新 Agent 列表"
                     title="刷新"
-                    disabled={refreshing}
-                    onClick={() => void refreshAgents()}
+                    isDisabled={refreshing}
+                    onPress={() => void refreshAgents()}
                   >
                     <RefreshCw size={16} className={refreshing ? 'spin' : ''} />
-                  </button>
+                  </ActionButton>
                 </div>
                 <div className="agent-settings-list">
                   {agents.map((agent) => (
@@ -1131,15 +1230,15 @@ export default function App() {
                   Codex 使用你在终端中已有的登录状态。需要登录时，在终端执行{' '}
                   <code>codex login</code>，然后刷新。
                 </div>
-                <button className="text-button" onClick={() => void workspace()}>
+                <ActionButton className="text-button" onPress={() => void workspace()}>
                   <FolderOpen size={14} />
                   更换工作目录
                   <ArrowUpRight size={13} />
-                </button>
-              </>
+                </ActionButton>
+              </Tabs.Panel>
             )}
             {settingsTab === 'browser' && (
-              <>
+              <Tabs.Panel id="browser">
                 <div className="integration-heading">
                   <div className="integration-icon large">
                     <Globe2 size={24} />
@@ -1161,23 +1260,26 @@ export default function App() {
                   <p className="file-path">
                     {browser.binaryPath || settings.browserPath || '尚未选择 BrowserOS neo'}
                   </p>
-                  <button className="secondary-button" onClick={() => void selectBrowser()}>
+                  <ActionButton className="secondary-button" onPress={() => void selectBrowser()}>
                     <FolderOpen size={14} />
                     选择 BrowserOS neo
-                  </button>
+                  </ActionButton>
                 </div>
                 {browser.error && <div className="inline-error">{browser.error}</div>}
                 <div className="settings-note">
                   网页使用独立的浏览器配置，不会导入日常浏览器中的账号。需要访问受保护页面时，可以在侧边浏览器中自行登录。
                 </div>
-                <button className="text-button" onClick={() => openLink('https://browseros.com/')}>
+                <ActionButton
+                  className="text-button"
+                  onPress={() => openLink('https://browseros.com/')}
+                >
                   <ArrowUpRight size={14} />
                   下载 BrowserOS neo
-                </button>
-              </>
+                </ActionButton>
+              </Tabs.Panel>
             )}
             {settingsTab === 'feishu' && (
-              <>
+              <Tabs.Panel id="feishu">
                 <div className="integration-heading">
                   <div className="integration-icon large">
                     <Link2 size={24} />
@@ -1209,13 +1311,13 @@ export default function App() {
                     <ShieldCheck size={28} />
                     <h4>暂时无法读取飞书配置</h4>
                     <p>原有配置不会被覆盖。检查系统授权和存储目录后，可以重试恢复。</p>
-                    <button
+                    <ActionButton
                       className="primary-button"
-                      onClick={() => void action('feishu:restore')}
+                      onPress={() => void action('feishu:restore')}
                     >
                       <RefreshCw size={14} />
                       重试恢复连接
-                    </button>
+                    </ActionButton>
                   </div>
                 ) : feishu.status === 'configuring' || feishu.setupQr ? (
                   <div className="feishu-setup">
@@ -1228,17 +1330,20 @@ export default function App() {
                       <strong>使用飞书扫码</strong>
                       <p>创建专用机器人，并确认接收私聊与回复消息的权限。</p>
                       {feishu.setupUrl && (
-                        <button className="text-button" onClick={() => openLink(feishu.setupUrl!)}>
+                        <ActionButton
+                          className="text-button"
+                          onPress={() => openLink(feishu.setupUrl!)}
+                        >
                           在浏览器中打开
                           <ArrowUpRight size={13} />
-                        </button>
+                        </ActionButton>
                       )}
-                      <button
+                      <ActionButton
                         className="text-button cancel-setup"
-                        onClick={() => void action('feishu:disconnect')}
+                        onPress={() => void action('feishu:disconnect')}
                       >
                         取消创建
-                      </button>
+                      </ActionButton>
                     </div>
                   </div>
                 ) : feishu.status === 'connected' ? (
@@ -1255,21 +1360,21 @@ export default function App() {
                     ) : (
                       <>
                         <p>向新机器人私聊发送下面这条消息：</p>
-                        <button
+                        <ActionButton
                           className="pairing-code"
-                          onClick={() => {
+                          onPress={() => {
                             void action('app:copy', { text: `绑定 ${feishu.pairingCode}` });
                             showToast('已复制配对消息');
                           }}
                         >
                           <code>绑定 {feishu.pairingCode}</code>
                           <Copy size={15} />
-                        </button>
+                        </ActionButton>
                         <small>配对后，仅接受你的任务指令。</small>
                         {feishu.appId && (
-                          <button
+                          <ActionButton
                             className="text-button"
-                            onClick={() =>
+                            onPress={() =>
                               openLink(
                                 `https://applink.feishu.cn/client/bot/open?appId=${encodeURIComponent(feishu.appId!)}`,
                               )
@@ -1277,7 +1382,7 @@ export default function App() {
                           >
                             打开飞书机器人
                             <ArrowUpRight size={13} />
-                          </button>
+                          </ActionButton>
                         )}
                       </>
                     )}
@@ -1294,10 +1399,10 @@ export default function App() {
                         ? '连接已保存的机器人，继续从飞书发起任务。'
                         : '创建一个属于这个工作区的机器人，从飞书发起网页任务。'}
                     </p>
-                    <button
+                    <ActionButton
                       className="primary-button"
-                      disabled={connecting || feishu.status === 'connecting'}
-                      onClick={() => void (feishu.appId ? action('feishu:connect') : setupFeishu())}
+                      isDisabled={connecting || feishu.status === 'connecting'}
+                      onPress={() => void (feishu.appId ? action('feishu:connect') : setupFeishu())}
                     >
                       {connecting ? (
                         <Loader2 size={15} className="spin" />
@@ -1307,11 +1412,11 @@ export default function App() {
                         <Plus size={15} />
                       )}
                       {feishu.appId ? '连接已保存的机器人' : '创建专用机器人'}
-                    </button>
+                    </ActionButton>
                     {feishu.appId && (
-                      <button className="text-button" onClick={() => void setupFeishu()}>
+                      <ActionButton className="text-button" onPress={() => void setupFeishu()}>
                         新建另一个机器人
-                      </button>
+                      </ActionButton>
                     )}
                   </div>
                 )}
@@ -1321,13 +1426,13 @@ export default function App() {
                     <span>{feishu.botName || '应用 ID'}</span>
                     <code>{feishu.appId}</code>
                     {feishu.status === 'connected' && (
-                      <button
+                      <ActionButton
                         className="text-button"
-                        onClick={() => void action('feishu:disconnect')}
+                        onPress={() => void action('feishu:disconnect')}
                       >
                         <Unplug size={13} />
                         断开连接
-                      </button>
+                      </ActionButton>
                     )}
                   </div>
                 )}
@@ -1357,7 +1462,7 @@ export default function App() {
                       >
                         <label>
                           App ID
-                          <input
+                          <Input
                             value={manualAppId}
                             onChange={(event) => setManualAppId(event.target.value)}
                             autoComplete="off"
@@ -1367,7 +1472,7 @@ export default function App() {
                         </label>
                         <label>
                           App Secret
-                          <input
+                          <Input
                             type="password"
                             value={manualSecret}
                             onChange={(event) => setManualSecret(event.target.value)}
@@ -1375,17 +1480,17 @@ export default function App() {
                             required
                           />
                         </label>
-                        <button className="secondary-button" type="submit">
+                        <ActionButton className="secondary-button" type="submit">
                           保存并连接
-                        </button>
+                        </ActionButton>
                       </form>
                     </details>
                   )}
-              </>
+              </Tabs.Panel>
             )}
           </div>
-        </Modal>
-      )}
-    </div>
+        </Tabs>
+      </SettingsModal>
+    </Sidebar.Provider>
   );
 }

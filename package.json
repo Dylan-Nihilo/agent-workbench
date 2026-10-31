@@ -1,6 +1,6 @@
 {
   "name": "athena",
-  "version": "0.2.4",
+  "version": "0.3.1",
   "private": true,
   "license": "UNLICENSED",
   "author": "Dylan",
@@ -16,7 +16,9 @@
     "test:e2e": "tsx tests/electron.e2e.ts",
     "test:live-agent": "tsx tests/live-agent.e2e.ts",
     "setup:browseros": "node scripts/setup-browseros.mjs",
-    "package": "npm run build && electron-builder --mac dir"
+    "package": "npm run build && electron-builder --mac dir",
+    "heroui:setup": "node scripts/setup-heroui-pro.mjs",
+    "postinstall": "npm run heroui:setup"
   },
   "build": {
     "appId": "app.agent.workbench",
@@ -32,7 +34,7 @@
       "package.json"
     ],
     "mac": {
-      "icon": "resources/icon.icns",
+      "icon": "resources/athena-icon.icns",
       "identity": "-",
       "hardenedRuntime": false,
       "category": "public.app-category.developer-tools",
@@ -42,16 +44,26 @@
     }
   },
   "dependencies": {
+    "@a2ui/react": "0.14.0",
+    "@a2ui/web_core": "0.14.0",
+    "@heroui-pro/react": "1.0.0-beta.10",
+    "@heroui/react": "3.2.7",
+    "@heroui/styles": "3.2.7",
     "@larksuiteoapi/node-sdk": "^1.76.0",
     "lucide-react": "^1.64.0",
+    "motion": "14.9.0",
     "qrcode": "^1.5.4",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "react-markdown": "^10.1.0",
-    "ws": "^8.22.0"
+    "react-resizable-panels": "4.15.3",
+    "tailwind-merge": "3.5.0",
+    "ws": "^8.22.0",
+    "zod": "3.25.76"
   },
   "devDependencies": {
     "@playwright/test": "^1.64.1",
+    "@tailwindcss/vite": "4.3.3",
     "@types/node": "^26.6.6",
     "@types/qrcode": "^1.5.6",
     "@types/react": "^19.3.0",
@@ -61,9 +73,16 @@
     "electron": "^45.1.0",
     "electron-builder": "^26.18.0",
     "esbuild": "^0.28.2",
+    "hpsetup": "4.7.4",
     "prettier": "^3.9.10",
+    "tailwindcss": "4.3.3",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vite": "^8.3.5"
+  },
+  "overrides": {
+    "dompurify": "3.4.17",
+    "tar": "7.5.22",
+    "figlet": "1.12.0"
   }
 }

@@ -1,19 +1,21 @@
-import codex from './assets/agents/codex.svg';
-import claude from './assets/agents/claudecode.svg';
+import codex from './assets/agents/codex-color.svg';
+import claude from './assets/agents/claudecode-color.svg';
 import opencode from './assets/agents/opencode.svg';
-import gemini from './assets/agents/geminicli.svg';
+import gemini from './assets/agents/geminicli-color.svg';
 import type { AgentId } from '../shared/types';
 
 const marks: Record<AgentId, string> = { codex, claude, opencode, gemini };
 
 export function AgentIcon({ agent, size = 20 }: { agent: AgentId; size?: number }) {
-  const mask = `url("${marks[agent]}")`;
   return (
-    <span
+    <img
       className="agent-icon"
       data-agent={agent}
+      src={marks[agent]}
+      alt=""
       aria-hidden="true"
-      style={{ width: size, height: size, maskImage: mask, WebkitMaskImage: mask }}
+      width={size}
+      height={size}
     />
   );
 }

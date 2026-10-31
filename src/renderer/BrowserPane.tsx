@@ -1,3 +1,6 @@
+import { Input, Tabs } from '@heroui/react';
+import { Segment, NativeSelect } from '@heroui-pro/react';
+import { ActionButton } from './ui';
 import { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
@@ -9,7 +12,7 @@ import {
   Globe2,
   Loader2,
   MousePointer2,
-  PanelBottom,
+  SlidersHorizontal,
   Play,
   Plus,
   RefreshCw,
@@ -21,12 +24,11 @@ import type {
   BrowserInput,
   BrowserState,
   BrowserViewport,
-  ElementDetails,
-  ElementEdit,
+  NativeNeoState,
   RecordedStep,
   Recording,
 } from '../shared/types';
-import { ElementInspector } from './ElementInspector';
+import { NeoHistory } from './NeoHistory';
 
 interface Props {
   state: BrowserState;
@@ -36,9 +38,12 @@ interface Props {
   onOpenSettings: () => void;
   onAnalyze: (id: string) => void;
   onClose: () => void;
-  onSourceRequest: (element: ElementDetails, changes?: ElementEdit) => void;
+  inspectorOpen: boolean;
+  onToggleInspector: () => void;
   initialFrame?: BrowserFrame;
   agentStatus?: string;
+  neo?: NativeNeoState;
+  nativeRecordId?: string;
 }
 function modifiers(event: {
   altKey: boolean;
@@ -61,14 +66,16 @@ export function BrowserPane({
   onOpenSettings,
   onAnalyze,
   onClose,
-  onSourceRequest,
+  inspectorOpen,
+  onToggleInspector,
   initialFrame,
   agentStatus,
+  neo,
+  nativeRecordId,
 }: Props) {
   const [url, setUrl] = useState(state.url);
-  const [mode, setMode] = useState<'page' | 'recordings'>('page');
+  const [mode, setMode] = useState<'page' | 'recordings' | 'neo'>('page');
   const [recordingId, setRecordingId] = useState<string>();
-  const [inspectorOpen, setInspectorOpen] = useState(false);
   const [frameLoading, setFrameLoading] = useState(!initialFrame?.data);
   const [viewportPending, setViewportPending] = useState(false);
   const [tabBusy, setTabBusy] = useState(false);
@@ -148,6 +155,9 @@ export function BrowserPane({
   useEffect(() => {
     if (mode !== 'page' && state.inspecting) void onAction('browser:inspect', { enabled: false });
   }, [mode, state.inspecting, onAction]);
+  useEffect(() => {
+    if (nativeRecordId) setMode('neo');
+  }, [nativeRecordId]);
   useEffect(() => () => cancelAnimationFrame(pointerFrame.current), []);
   useEffect(() => {
     if (document.activeElement !== address.current)
@@ -155,7 +165,6 @@ export function BrowserPane({
   }, [state.url]);
   useEffect(() => {
     if (state.selectedElement) {
-      setInspectorOpen(true);
       setMode('page');
     }
   }, [state.selectedElement?.ref]);
@@ -378,98 +387,95 @@ export function BrowserPane({
         <div className="browser-heading-name">
           <Globe2 size={16} />
           <span>浏览器</span>
-          <span className="engine-label">BrowserOS neo</span>
+          <span className="engine-label" title={neo?.error || neo?.version}>
+            Neo{' '}
+            {neo?.status === 'ready' ? '已连接' : neo?.status === 'starting' ? '连接中' : '未连接'}
+          </span>
         </div>
-        <button
+        <ActionButton
           className="icon-button quiet"
           aria-label="收起浏览器"
           title="收起浏览器"
-          onClick={onClose}
+          onPress={onClose}
         >
           <X size={16} />
-        </button>
+        </ActionButton>
       </header>
-      <div className="browser-tabbar" role="tablist" aria-label="网页标签">
-        {(state.tabs ?? []).map((tab, index) => (
-          <div
-            className={`browser-tab ${tab.id === state.activeTabId ? 'is-active' : ''}`}
-            key={tab.id}
-          >
-            <button
-              role="tab"
-              aria-selected={tab.id === state.activeTabId}
+      <Tabs
+        className="browser-tabstrip"
+        selectedKey={state.activeTabId || ''}
+        onSelectionChange={(key) => {
+          setMode('page');
+          void changeTab('browser:switch-tab', String(key));
+        }}
+      >
+        <Tabs.List className="browser-tabbar" aria-label="网页标签">
+          {(state.tabs ?? []).map((tab) => (
+            <Tabs.Tab
+              className={`browser-tab ${tab.id === state.activeTabId ? 'is-active' : ''}`}
+              key={tab.id}
+              id={tab.id}
               aria-label={tab.title || '新标签页'}
-              tabIndex={tab.id === state.activeTabId ? 0 : -1}
-              disabled={tabBusy}
-              title={tab.url === 'about:blank' ? '新标签页' : tab.url}
-              onClick={() => {
-                setMode('page');
-                void changeTab('browser:switch-tab', tab.id);
-              }}
-              onKeyDown={(event) => {
-                const offset = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0;
-                if (!offset) return;
-                event.preventDefault();
-                const next = state.tabs[(index + offset + state.tabs.length) % state.tabs.length];
-                void changeTab('browser:switch-tab', next.id);
-              }}
+              isDisabled={tabBusy}
             >
               {tab.loading ? <Loader2 size={12} className="spin" /> : <Globe2 size={12} />}
-              <span>{tab.title || '新标签页'}</span>
-            </button>
-            <button
-              className="tab-close"
-              aria-label={`关闭标签 ${tab.title || '新标签页'}`}
-              disabled={tabBusy}
-              onClick={() => void changeTab('browser:close-tab', tab.id)}
-            >
-              <X size={12} />
-            </button>
-          </div>
-        ))}
-        <button
+              <span title={tab.url === 'about:blank' ? '新标签页' : tab.url}>
+                {tab.title || '新标签页'}
+              </span>
+              <ActionButton
+                className="tab-close"
+                aria-label={`关闭标签 ${tab.title || '新标签页'}`}
+                isDisabled={tabBusy}
+                onPress={() => void changeTab('browser:close-tab', tab.id)}
+              >
+                <X size={12} />
+              </ActionButton>
+            </Tabs.Tab>
+          ))}
+        </Tabs.List>
+        <ActionButton
           className="icon-button new-tab-button"
           aria-label="新建标签页"
           title="新建标签页 ⌘T"
-          disabled={!ready || tabBusy}
-          onClick={() => void newTab()}
+          isDisabled={!ready || tabBusy}
+          onPress={() => void newTab()}
         >
           <Plus size={15} />
-        </button>
-      </div>
+        </ActionButton>
+      </Tabs>
       <div className="browser-navigation">
         <div className="nav-buttons">
-          <button
+          <ActionButton
             className="icon-button"
             title="后退"
             aria-label="后退"
-            disabled={!ready || !state.canGoBack}
-            onClick={() => void onAction('browser:back')}
+            isDisabled={!ready || !state.canGoBack}
+            onPress={() => void onAction('browser:back')}
           >
             <ArrowLeft size={16} />
-          </button>
-          <button
+          </ActionButton>
+          <ActionButton
             className="icon-button"
             title="前进"
             aria-label="前进"
-            disabled={!ready || !state.canGoForward}
-            onClick={() => void onAction('browser:forward')}
+            isDisabled={!ready || !state.canGoForward}
+            onPress={() => void onAction('browser:forward')}
           >
             <ArrowRight size={16} />
-          </button>
-          <button
+          </ActionButton>
+          <ActionButton
             className="icon-button"
             title="刷新"
             aria-label="刷新"
-            disabled={!ready}
-            onClick={() => void onAction('browser:reload')}
+            isDisabled={!ready}
+            onPress={() => void onAction('browser:reload')}
           >
             <RefreshCw size={15} className={busy ? 'spin' : ''} />
-          </button>
+          </ActionButton>
         </div>
         <form className="address-field" onSubmit={(event) => void navigate(event)}>
           <Globe2 size={13} />
-          <input
+          <Input
             ref={address}
             aria-label="网页地址"
             placeholder="输入网址"
@@ -478,40 +484,48 @@ export function BrowserPane({
             onFocus={(event) => event.target.select()}
             spellCheck={false}
           />
-          <button aria-label="打开网页" title="打开网页" type="submit" disabled={!ready || tabBusy}>
+          <ActionButton
+            aria-label="打开网页"
+            title="打开网页"
+            type="submit"
+            isDisabled={!ready || tabBusy}
+          >
             <ArrowUpRight size={14} />
-          </button>
+          </ActionButton>
         </form>
       </div>
       <div className="browser-tools">
-        <div className="segment-tabs">
-          <button className={mode === 'page' ? 'active' : ''} onClick={() => setMode('page')}>
-            网页
-          </button>
-          <button
-            className={mode === 'recordings' ? 'active' : ''}
-            onClick={() => setMode('recordings')}
-          >
-            操作记录{recordings.length > 0 && <span>{recordings.length}</span>}
-          </button>
-        </div>
+        <Segment
+          className="browser-modes"
+          aria-label="浏览器视图"
+          size="sm"
+          selectedKey={mode}
+          onSelectionChange={(key) => setMode(key as typeof mode)}
+        >
+          <Segment.Item id="page">网页</Segment.Item>
+          <Segment.Item id="recordings">
+            操作记录
+            {recordings.length > 0 && <span className="record-count">{recordings.length}</span>}
+          </Segment.Item>
+          <Segment.Item id="neo">网页任务</Segment.Item>
+        </Segment>
         <div className="tool-buttons">
-          <button
+          <ActionButton
             className={`icon-button ${inspectorOpen ? 'is-on' : ''}`}
             title="元素检查器"
             aria-label="元素检查器"
-            disabled={!ready}
-            onClick={() => {
+            isDisabled={!ready}
+            onPress={() => {
               setMode('page');
-              setInspectorOpen((value) => !value);
+              onToggleInspector();
             }}
           >
-            <PanelBottom size={15} />
-          </button>
-          <button
+            <SlidersHorizontal size={15} />
+          </ActionButton>
+          <ActionButton
             className={`subtle-button ${state.inspecting ? 'selected' : ''}`}
-            disabled={!ready}
-            onClick={() => {
+            isDisabled={!ready}
+            onPress={() => {
               setMode('page');
               inspectActive.current = !state.inspecting;
               void onAction<boolean>('browser:inspect', { enabled: !state.inspecting }).then(
@@ -523,15 +537,15 @@ export function BrowserPane({
           >
             <MousePointer2 size={14} />
             选取元素
-          </button>
-          <button
+          </ActionButton>
+          <ActionButton
             className={`subtle-button ${state.recording ? 'recording' : ''}`}
-            disabled={!ready}
-            onClick={() => void toggleRecord()}
+            isDisabled={!ready}
+            onPress={() => void toggleRecord()}
           >
             {state.recording ? <Square size={11} fill="currentColor" /> : <Circle size={12} />}
             <span>{state.recording ? '结束录制' : '录制'}</span>
-          </button>
+          </ActionButton>
         </div>
       </div>
       {mode === 'page' ? (
@@ -541,12 +555,12 @@ export function BrowserPane({
               <MousePointer2 size={13} />
               悬停预览，点击选中
               <kbd>Esc 取消</kbd>
-              <button
+              <ActionButton
                 aria-label="取消选取"
-                onClick={() => void onAction('browser:inspect', { enabled: false })}
+                onPress={() => void onAction('browser:inspect', { enabled: false })}
               >
                 <X size={13} />
-              </button>
+              </ActionButton>
             </div>
           )}
           <div
@@ -605,12 +619,12 @@ export function BrowserPane({
                 {viewportError ? (
                   <>
                     <span>页面显示调整失败</span>
-                    <button
+                    <ActionButton
                       className="secondary-button"
-                      onClick={() => setViewportRetry((value) => value + 1)}
+                      onPress={() => setViewportRetry((value) => value + 1)}
                     >
                       重试
-                    </button>
+                    </ActionButton>
                   </>
                 ) : (
                   <>
@@ -672,15 +686,15 @@ export function BrowserPane({
                 <p>{state.error || '选择本机的 BrowserOS neo，即可在这里浏览和操作网页。'}</p>
                 {state.status !== 'starting' && (
                   <div className="button-row">
-                    <button className="primary-button" onClick={onOpenSettings}>
+                    <ActionButton className="primary-button" onPress={onOpenSettings}>
                       浏览器设置
-                    </button>
-                    <button
+                    </ActionButton>
+                    <ActionButton
                       className="secondary-button"
-                      onClick={() => void onAction('browser:start')}
+                      onPress={() => void onAction('browser:start')}
                     >
                       重新连接
-                    </button>
+                    </ActionButton>
                   </div>
                 )}
               </div>
@@ -691,7 +705,7 @@ export function BrowserPane({
               <span className="record-dot" />
               <span>正在记录操作</span>
               <span className="muted">{liveSteps.length} 步</span>
-              <button onClick={() => void toggleRecord()}>结束并查看</button>
+              <ActionButton onPress={() => void toggleRecord()}>结束并查看</ActionButton>
             </div>
           )}
           <div className="browser-status">
@@ -703,25 +717,27 @@ export function BrowserPane({
                   ? '正在连接'
                   : '未连接'}
             </span>
-            <select
-              className="viewport-mode"
-              aria-label="页面缩放"
-              title={fitLimited ? '页面超宽，可按住 Shift 滚轮横向查看' : '选择页面显示比例'}
-              value={zoomMode}
-              disabled={!ready || state.loading}
-              onChange={(event) => {
-                if (state.activeTabId)
-                  setZoomModes((previous) => ({
-                    ...previous,
-                    [state.activeTabId!]: event.target.value as 'fit' | 'actual',
-                  }));
-              }}
-            >
-              <option value="fit">
-                适应宽度{zoomMode === 'fit' && zoomPercent < 100 ? ` · ${zoomPercent}%` : ''}
-              </option>
-              <option value="actual">100%</option>
-            </select>
+            <NativeSelect className="viewport-select">
+              <NativeSelect.Trigger
+                className="viewport-mode"
+                aria-label="页面缩放"
+                title={fitLimited ? '页面超宽，可按住 Shift 滚轮横向查看' : '选择页面显示比例'}
+                value={zoomMode}
+                disabled={!ready || state.loading}
+                onChange={(event) => {
+                  if (state.activeTabId)
+                    setZoomModes((previous) => ({
+                      ...previous,
+                      [state.activeTabId!]: event.target.value as 'fit' | 'actual',
+                    }));
+                }}
+              >
+                <NativeSelect.Option value="fit">
+                  适应宽度{zoomMode === 'fit' && zoomPercent < 100 ? ` · ${zoomPercent}%` : ''}
+                </NativeSelect.Option>
+                <NativeSelect.Option value="actual">100%</NativeSelect.Option>
+              </NativeSelect.Trigger>
+            </NativeSelect>
             {fitLimited && zoomMode === 'fit' && <span className="viewport-limit">可横向滚动</span>}
             {state.inspecting ? (
               <span className="status-right">选择元素</span>
@@ -733,6 +749,8 @@ export function BrowserPane({
             ) : null}
           </div>
         </div>
+      ) : mode === 'neo' ? (
+        <NeoHistory state={neo} selectedId={nativeRecordId} onAction={onAction} />
       ) : (
         <div className="recordings-view">
           {!recording ? (
@@ -740,14 +758,14 @@ export function BrowserPane({
               <Circle size={30} strokeWidth={1.2} />
               <h3>保留操作发生的过程</h3>
               <p>点击录制，完成一段网页操作。结束后可以交给 Agent 理解和整理。</p>
-              <button
+              <ActionButton
                 className="secondary-button"
-                disabled={!ready}
-                onClick={() => void toggleRecord()}
+                isDisabled={!ready}
+                onPress={() => void toggleRecord()}
               >
                 <Circle size={13} />
                 开始录制
-              </button>
+              </ActionButton>
             </div>
           ) : (
             <>
@@ -763,28 +781,30 @@ export function BrowserPane({
                     })}
                   </p>
                 </div>
-                <button
+                <ActionButton
                   className="icon-button"
                   title="导出操作记录"
                   aria-label="导出操作记录"
-                  onClick={() => void onAction('recording:export', { id: recording.id })}
+                  onPress={() => void onAction('recording:export', { id: recording.id })}
                 >
                   <Download size={16} />
-                </button>
+                </ActionButton>
               </div>
               {recordings.length > 1 && (
-                <select
-                  className="recording-select"
-                  aria-label="选择操作记录"
-                  value={recording.id}
-                  onChange={(event) => setRecordingId(event.target.value)}
-                >
-                  {recordings.map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {item.title} · {item.steps.length} 步
-                    </option>
-                  ))}
-                </select>
+                <NativeSelect className="viewport-select">
+                  <NativeSelect.Trigger
+                    className="recording-select"
+                    aria-label="选择操作记录"
+                    value={recording.id}
+                    onChange={(event) => setRecordingId(event.target.value)}
+                  >
+                    {recordings.map((item) => (
+                      <NativeSelect.Option key={item.id} value={item.id}>
+                        {item.title} · {item.steps.length} 步
+                      </NativeSelect.Option>
+                    ))}
+                  </NativeSelect.Trigger>
+                </NativeSelect>
               )}
               <ol className="step-list">
                 {recording.steps.map((step, index) => (
@@ -807,13 +827,13 @@ export function BrowserPane({
                 <p className="empty-detail">这段录制没有捕获到操作。回到网页重新录制一段流程。</p>
               )}
               <div className="recording-footer">
-                <button
+                <ActionButton
                   className="primary-button"
-                  disabled={!recording.steps.length}
-                  onClick={() => onAnalyze(recording.id)}
+                  isDisabled={!recording.steps.length}
+                  onPress={() => onAnalyze(recording.id)}
                 >
                   <Play size={14} />让 Agent 理解这段操作
-                </button>
+                </ActionButton>
                 <p>
                   {recording.summary
                     ? '已有分析结果，再次分析会创建新的对话。'
@@ -824,15 +844,6 @@ export function BrowserPane({
           )}
         </div>
       )}
-      <ElementInspector
-        hidden={mode !== 'page' || !inspectorOpen}
-        selected={state.selectedElement}
-        tabId={state.activeTabId}
-        previews={state.previewEdits ?? []}
-        onAction={onAction}
-        onClose={() => setInspectorOpen(false)}
-        onSourceRequest={onSourceRequest}
-      />
     </section>
   );
 }

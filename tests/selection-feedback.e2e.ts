@@ -152,6 +152,7 @@ try {
   await screenshot('hover');
   assert.equal((await snapshot()).browser.selectedElement, undefined);
   await page.mouse.click(target.x, target.y);
+  await page.getByRole('tab', { name: '内容', exact: true }).click();
   await expect(page.getByRole('textbox', { name: '元素文字', exact: true })).toHaveValue(
     '把下一步想清楚',
   );
@@ -189,6 +190,7 @@ try {
   );
   const heading = await query('#headline');
   await page.evaluate((ref) => window.workbench.invoke('browser:element', { ref }), heading.ref);
+  await page.getByRole('tab', { name: '内容', exact: true }).click();
   await expect(page.getByRole('textbox', { name: '元素文字', exact: true })).toHaveValue(
     '把下一步想清楚',
   );
@@ -207,6 +209,8 @@ try {
   await expect.poll(async () => (await query('#headline')).text).toBe('让想法成为现实');
   await expect(page.getByRole('button', { name: '停止任务', exact: true })).toHaveCount(0);
   await expect(page.locator('.browser-agent-status')).toHaveCount(0);
+  await page.getByRole('tab', { name: '元素', exact: true }).click();
+  await page.getByRole('tab', { name: '内容', exact: true }).click();
   await expect(page.getByRole('textbox', { name: '元素文字', exact: true })).toHaveValue(
     '让想法成为现实',
   );
